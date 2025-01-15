@@ -16,15 +16,18 @@
 #ifndef ASYNC_SIMPLE_UTHREAD_UTHREAD_H
 #define ASYNC_SIMPLE_UTHREAD_UTHREAD_H
 
-#include <async_simple/uthread/internal/thread.h>
+#ifndef ASYNC_SIMPLE_USE_MODULES
 #include <memory>
+#include "async_simple/uthread/internal/thread.h"
+
+#endif  // ASYNC_SIMPLE_USE_MODULES
 
 namespace async_simple {
 namespace uthread {
 
-class Attribute {
-public:
+struct Attribute {
     Executor* ex;
+    size_t stack_size = 0;
 };
 
 // A Uthread is a stackful coroutine which would checkin/checkout based on
@@ -42,7 +45,8 @@ public:
     Uthread() = default;
     template <class Func>
     Uthread(Attribute attr, Func&& func) : _attr(std::move(attr)) {
-        _ctx = std::make_unique<internal::thread_context>(std::move(func));
+        _ctx = std::make_unique<internal::thread_context>(std::move(func),
+                                                          _attr.stack_size);
     }
     ~Uthread() = default;
     Uthread(Uthread&& x) noexcept = default;

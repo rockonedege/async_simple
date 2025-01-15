@@ -16,7 +16,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <thread>
-#include "asio_util.hpp"
+#include "asio_coro_util.hpp"
 
 using asio::ip::tcp;
 
@@ -53,13 +53,14 @@ async_simple::coro::Lazy<void> start_server(asio::io_context& io_context,
     tcp::acceptor a(io_context, tcp::endpoint(tcp::v4(), port));
     std::cout << "Listen port " << port << " successfully.\n";
     for (;;) {
-        auto [error, socket] = co_await async_accept(a);
+        tcp::socket socket(io_context);
+        auto error = co_await async_accept(a, socket);
         if (error) {
             std::cout << "Accept failed, error: " << error.message() << '\n';
             continue;
         }
-        std::cout << "New client comming.\n";
-        session(std::move(socket)).via(E).start([](auto&&) {});
+        std::cout << "New client coming.\n";
+        session(std::move(socket)).via(E).detach();
     }
 }
 

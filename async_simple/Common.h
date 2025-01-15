@@ -16,12 +16,11 @@
 #ifndef ASYNC_SIMPLE_COMMON_H
 #define ASYNC_SIMPLE_COMMON_H
 
+#ifndef ASYNC_SIMPLE_USE_MODULES
 #include <stdexcept>
+#include "async_simple/CommonMacros.h"
 
-#define FL_LIKELY(x) __builtin_expect((x), 1)
-#define FL_UNLIKELY(x) __builtin_expect((x), 0)
-
-#define FL_INLINE __attribute__((__always_inline__)) inline
+#endif  // ASYNC_SIMPLE_USE_MODULES
 
 namespace async_simple {
 // Different from assert, logicAssert is meaningful in
@@ -31,9 +30,8 @@ namespace async_simple {
 // a bug in the library. If logicAssert fails, it means
 // there is a bug in the user code.
 inline void logicAssert(bool x, const char* errorMsg) {
-    if (FL_LIKELY(x)) {
-        return;
-    }
+    if (x)
+        AS_LIKELY { return; }
     throw std::logic_error(errorMsg);
 }
 

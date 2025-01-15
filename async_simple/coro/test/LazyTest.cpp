@@ -13,23 +13,39 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <gtest/gtest.h>
 #include <atomic>
 #include <condition_variable>
 #include <exception>
 #include <functional>
+#include <future>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <system_error>
+#include <thread>
 #include <type_traits>
 
 #include <iostream>
 
-#include <async_simple/coro/Lazy.h>
-#include <async_simple/coro/Task.h>
-#include <async_simple/coro/test/Time.h>
-#include <async_simple/executors/SimpleExecutor.h>
-#include <async_simple/experimental/coroutine.h>
-#include <async_simple/test/unittest.h>
+#include <chrono>
+#include "async_simple/Executor.h"
+#include "async_simple/Promise.h"
+#include "async_simple/Signal.h"
+#include "async_simple/Try.h"
+#include "async_simple/coro/Collect.h"
+#include "async_simple/coro/FutureAwaiter.h"
+#include "async_simple/coro/Lazy.h"
+#include "async_simple/coro/Sleep.h"
+#include "async_simple/coro/SyncAwait.h"
+#include "async_simple/coro/test/Time.h"
+#include "async_simple/executors/SimpleExecutor.h"
+#include "async_simple/experimental/coroutine.h"
+#include "async_simple/test/unittest.h"
+#include "async_simple/util/Condition.h"
 
 using namespace std;
+using namespace std::chrono_literals;
 
 namespace async_simple {
 namespace coro {
@@ -74,8 +90,7 @@ public:
             ValueAwaiter(LazyTest* t) : test(t), value(0) {}
 
             bool await_ready() { return false; }
-            void await_suspend(
-                STD_CORO::coroutine_handle<> continuation) noexcept {
+            void await_suspend(std::coroutine_handle<> continuation) noexcept {
                 test->applyValue(
                     [this, c = std::move(continuation)](int v) mutable {
                         value = v;
@@ -97,8 +112,7 @@ public:
             ValueAwaiter() {}
 
             bool await_ready() { return false; }
-            void await_suspend(
-                STD_CORO::coroutine_handle<> continuation) noexcept {
+            void await_suspend(std::coroutine_handle<> continuation) noexcept {
                 std::thread([c = continuation]() mutable {
                     c.resume();
                 }).detach();
@@ -118,8 +132,7 @@ public:
             ValueAwaiter(T v) : value(v) {}
 
             bool await_ready() { return false; }
-            void await_suspend(
-                STD_CORO::coroutine_handle<> continuation) noexcept {
+            void await_suspend(std::coroutine_handle<> continuation) noexcept {
                 std::thread([c = continuation]() mutable {
                     c.resume();
                 }).detach();
@@ -133,24 +146,65 @@ public:
         co_return ret;
     }
 
-    template <bool thread_id = false>
-    Lazy<int> getValueWithSleep(int x) {
+    template <typename T>
+    Lazy<T> getValueWithSleep(T x, std::chrono::microseconds msec =
+                                       std::chrono::microseconds::max()) {
         struct ValueAwaiter {
-            int value;
-            ValueAwaiter(int v) : value(v) {}
+            T value;
+            std::chrono::microseconds msec;
+            ValueAwaiter(T v, std::chrono::microseconds msec)
+                : value(v), msec(msec) {}
 
             bool await_ready() { return false; }
-            void await_suspend(
-                STD_CORO::coroutine_handle<> continuation) noexcept {
-                std::thread([c = continuation]() mutable {
-                    usleep(rand() % 1000 + 1);
+            void await_suspend(std::coroutine_handle<> continuation) noexcept {
+                std::thread([this, c = continuation]() mutable {
+                    std::this_thread::sleep_for(msec);
                     c.resume();
                 }).detach();
             }
-            int await_resume() noexcept { return value; }
+            T await_resume() noexcept { return value; }
         };
         auto id1 = std::this_thread::get_id();
-        auto ret = co_await ValueAwaiter(x);
+        if (msec == std::chrono::microseconds::max()) {
+            msec = std::chrono::microseconds(rand() % 1000 + 1);
+        }
+        auto ret = co_await ValueAwaiter(x, msec);
+        auto id2 = std::this_thread::get_id();
+        EXPECT_EQ(id1, id2);
+        co_return ret;
+    }
+
+    template <typename T>
+    Lazy<T> getValueWithCV(T x, std::condition_variable& cv, bool& ready,
+                           int& cnt, std::mutex& mutex) {
+        struct ValueAwaiter {
+            T value;
+            std::condition_variable& cv;
+            bool& ready;
+            int& cnt;
+            std::mutex& mutex;
+            ValueAwaiter(T value, std::condition_variable& cv, bool& ready,
+                         int& cnt, std::mutex& mutex)
+                : value(value), cv(cv), ready(ready), cnt(cnt), mutex(mutex) {}
+
+            bool await_ready() { return false; }
+            void await_suspend(std::coroutine_handle<> continuation) noexcept {
+                std::thread([this, c = continuation]() mutable {
+                    int condition;
+                    {
+                        std::unique_lock lk(mutex);
+                        cv.wait(lk, [this]() -> bool { return this->ready; });
+                        condition = --cnt;
+                    }
+                    if (condition == 0)
+                        cv.notify_one();
+                    c.resume();
+                }).detach();
+            }
+            T await_resume() noexcept { return value; }
+        };
+        auto id1 = std::this_thread::get_id();
+        auto ret = co_await ValueAwaiter(x, cv, ready, cnt, mutex);
         auto id2 = std::this_thread::get_id();
         EXPECT_EQ(id1, id2);
         co_return ret;
@@ -160,10 +214,10 @@ public:
         struct ValueAwaiter {
             ValueAwaiter() {}
             bool await_ready() { return false; }
-            void await_suspend(
-                STD_CORO::coroutine_handle<> continuation) noexcept {
+            void await_suspend(std::coroutine_handle<> continuation) noexcept {
                 std::thread([c = continuation]() mutable {
-                    usleep(rand() % 1000000 + 1);
+                    std::this_thread::sleep_for(
+                        std::chrono::microseconds(rand() % 1000000 + 1));
                     c.resume();
                 }).detach();
             }
@@ -200,6 +254,31 @@ TEST_F(LazyTest, testSimpleAsync) {
     };
     triggerValue(100);
     ASSERT_EQ(101, syncAwait(test().via(&_executor)));
+}
+
+TEST_F(LazyTest, testSimpleAsync2) {
+    auto test = [this]() -> Lazy<int> {
+        CHECK_EXECUTOR(&_executor);
+        auto ret = co_await plusOne();
+        CHECK_EXECUTOR(&_executor);
+        co_return ret;
+    };
+    triggerValue(100);
+    ASSERT_EQ(101, syncAwait(test(), &_executor));
+}
+
+TEST_F(LazyTest, testStartWithExecutor) {
+    auto test = [this]() -> Lazy<void> {
+        auto executor = co_await CurrentExecutor();
+        EXPECT_TRUE(executor == &_executor);
+        EXPECT_TRUE(executor->currentThreadInExecutor() == false);
+        co_await async_simple::coro::sleep(10ms);
+        CHECK_EXECUTOR(&_executor);
+        co_return;
+    };
+    std::promise<void> f;
+    test().directlyStart([&f](auto&&) { f.set_value(); }, &_executor);
+    f.get_future().wait();
 }
 
 TEST_F(LazyTest, testVia) {
@@ -244,25 +323,45 @@ TEST_F(LazyTest, testYield) {
     };
 
     test1(m1, value1).via(&executor).start([](Try<void> result) {});
-    usleep(100000);
+    std::this_thread::sleep_for(100000us);
     ASSERT_EQ(0, value1);
 
     test2(m2, value2).via(&executor).start([](Try<void> result) {});
-    usleep(100000);
+    std::this_thread::sleep_for(100000us);
     ASSERT_EQ(0, value2);
 
     m1.unlock();
-    usleep(100000);
+    std::this_thread::sleep_for(100000us);
     ASSERT_EQ(0, value1);
     ASSERT_EQ(0, value2);
 
     m2.unlock();
-    usleep(100000);
+    std::this_thread::sleep_for(100000us);
     ASSERT_EQ(1, value1);
     ASSERT_EQ(1, value2);
 
     m1.unlock();
     m2.unlock();
+}
+
+TEST_F(LazyTest, testYieldCancel) {
+    executors::SimpleExecutor executor(1);
+    auto test1 = []() -> Lazy<void> {
+        while (true) {
+            co_await Yield{};
+        }
+    };
+    auto signal = async_simple::Signal::create();
+    std::promise<void> p;
+    test1()
+        .setLazyLocal(signal.get())
+        .via(&executor)
+        .start([&](Try<void>&& result) {
+            EXPECT_EQ(result.hasError(), true);
+            p.set_value();
+        });
+    signal->emit(SignalType::Terminate);
+    p.get_future().wait();
 }
 
 TEST_F(LazyTest, testVoid) {
@@ -290,9 +389,9 @@ TEST_F(LazyTest, testExecutor) {
     executors::SimpleExecutor e1(1);
     executors::SimpleExecutor e2(1);
     auto addTwo = [&](int x) -> Lazy<int> {
-        CHECK_EXECUTOR(&e2);
+        CHECK_EXECUTOR(&e1);
         auto tmp = co_await getValue(x);
-        CHECK_EXECUTOR(&e2);
+        CHECK_EXECUTOR(&e1);
         co_return tmp + 2;
     };
     {
@@ -302,9 +401,9 @@ TEST_F(LazyTest, testExecutor) {
             CHECK_EXECUTOR(&e1);
             int y = co_await plusOne();
             CHECK_EXECUTOR(&e1);
-            int z = co_await addTwo(y).via(&e2);
+            auto z = co_await addTwo(y).coAwaitTry();
             CHECK_EXECUTOR(&e1);
-            co_return z;
+            co_return z.value();
         };
         triggerValue(100);
         auto val = syncAwait(test().via(&e1));
@@ -343,7 +442,7 @@ TEST_F(LazyTest, testDetachedCoroutine) {
     triggerValue(100);
     test().via(&_executor).start([](Try<void> result) {});
     while (value.load() != 111) {
-        usleep(1000);
+        std::this_thread::sleep_for(1000us);
     }
 }
 
@@ -418,7 +517,11 @@ TEST_F(LazyTest, testCollectAll) {
 }
 
 TEST_F(LazyTest, testCollectAllBatched) {
+#ifndef NDEBUG
+    int task_num = 500;
+#else
     int task_num = 5000;
+#endif
     long total = 0;
     for (auto i = 0; i < task_num; i++) {
         total += i;
@@ -445,7 +548,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
         auto out = co_await std::move(combinedLazy);
 
         CHECK_EXECUTOR(&e1);
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         co_await CurrentExecutor();
         int sum = 0;
         for (size_t i = 0; i < out.size(); i++) {
@@ -490,7 +593,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
         auto out = co_await std::move(combinedLazy);
 
         CHECK_EXECUTOR(&e2);
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         co_await CurrentExecutor();
         int sum = 0;
         for (size_t i = 0; i < out.size(); i++) {
@@ -514,7 +617,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
 
         auto out = co_await std::move(combinedLazy);
 
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         CHECK_EXECUTOR(&e2);
         co_await CurrentExecutor();
     };
@@ -536,7 +639,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
         auto out = co_await std::move(combinedLazy);
 
         CHECK_EXECUTOR(&e3);
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         int sum = 0;
         for (size_t i = 0; i < out.size(); i++) {
             sum += out[i].value();
@@ -559,7 +662,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
         CHECK_EXECUTOR(&e3);
         auto out = co_await std::move(combinedLazy);
 
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         CHECK_EXECUTOR(&e3);
     };
     syncAwait(test3Void().via(&e3));
@@ -577,7 +680,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
             collectAllWindowed(10, false, std::move(input), outAlloc);
         CHECK_EXECUTOR(&e4);
         auto out = co_await std::move(combinedLazy);
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         CHECK_EXECUTOR(&e4);
         int sum = 0;
         for (size_t i = 0; i < out.size(); i++) {
@@ -611,7 +714,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
         auto out = co_await std::move(combinedLazy);
 
         CHECK_EXECUTOR(&e6);
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         int sum = 0;
         for (size_t i = 0; i < out.size(); i++) {
             sum += out[i].value();
@@ -641,7 +744,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
 
         auto out = co_await std::move(combinedLazy);
 
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         CHECK_EXECUTOR(&e6);
     };
     syncAwait(test5Void().via(&e6));
@@ -665,7 +768,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
         auto out = co_await std::move(combinedLazy);
 
         CHECK_EXECUTOR(&e6);
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         int sum = 0;
         for (size_t i = 0; i < out.size(); i++) {
             sum += out[i].value();
@@ -691,7 +794,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
         auto combinedLazy = collectAllWindowed(10, false, std::move(input));
         CHECK_EXECUTOR(&e6);
         auto out = co_await std::move(combinedLazy);
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         CHECK_EXECUTOR(&e6);
     };
     syncAwait(test6Void().via(&e6));
@@ -719,7 +822,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
         auto out = co_await std::move(combinedLazy);
 
         CHECK_EXECUTOR(&e6);
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         int sum = 0;
         for (size_t i = 0; i < out.size(); i++) {
             sum += out[i].value();
@@ -750,7 +853,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
         CHECK_EXECUTOR(&e6);
         auto out = co_await std::move(combinedLazy);
 
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         CHECK_EXECUTOR(&e6);
     };
     syncAwait(test7Void().via(&e6));
@@ -778,7 +881,7 @@ TEST_F(LazyTest, testCollectAllBatched) {
         auto out = co_await std::move(combinedLazy);
 
         CHECK_EXECUTOR(&e6);
-        EXPECT_EQ(task_num, out.size());
+        EXPECT_EQ(static_cast<size_t>(task_num), out.size());
         int sum = 0;
         for (size_t i = 0; i < out.size(); i++) {
             sum += out[i].value();
@@ -898,7 +1001,7 @@ TEST_F(LazyTest, testCollectAllVariadic) {
         auto v_try_void01 = std::get<1>(std::move(out_tuple));
         auto v_try_void02 = std::get<2>(std::move(out_tuple));
 
-        EXPECT_EQ(2u, v_try_int.value());
+        EXPECT_EQ(2, v_try_int.value());
 
         bool b1 = std::is_same_v<Try<void>, decltype(v_try_void01)>;
         bool b2 = std::is_same_v<Try<void>, decltype(v_try_void02)>;
@@ -963,7 +1066,7 @@ TEST_F(LazyTest, testCollectAllVariadic) {
         auto v_try_void01 = std::get<1>(std::move(out_tuple));
         auto v_try_void02 = std::get<2>(std::move(out_tuple));
 
-        EXPECT_EQ(2u, v_try_int.value());
+        EXPECT_EQ(2, v_try_int.value());
         bool b1 = std::is_same_v<Try<void>, decltype(v_try_void01)>;
         bool b2 = std::is_same_v<Try<void>, decltype(v_try_void02)>;
         EXPECT_TRUE(b1);
@@ -972,6 +1075,68 @@ TEST_F(LazyTest, testCollectAllVariadic) {
         CHECK_EXECUTOR(&e1);
     };
     syncAwait(test3().via(&e1));
+
+    // void task
+    auto test4 = [this, &e2]() -> Lazy<> {
+        CHECK_EXECUTOR(&e2);
+        auto combinedLazy = collectAll(
+            // test temporary object
+            getValue(2), makeVoidTask(), testExcept());
+        CHECK_EXECUTOR(&e2);
+
+        auto out_tuple = co_await std::move(combinedLazy);
+        EXPECT_EQ(3u, std::tuple_size<decltype(out_tuple)>::value);
+
+        auto v_try_int = std::get<0>(std::move(out_tuple));
+        auto v_try_void01 = std::get<1>(std::move(out_tuple));
+        auto v_try_void02 = std::get<2>(std::move(out_tuple));
+
+        EXPECT_EQ(2, v_try_int.value());
+
+        bool b1 = std::is_same_v<Try<void>, decltype(v_try_void01)>;
+        bool b2 = std::is_same_v<Try<void>, decltype(v_try_void02)>;
+        try {  // v_try_void02 throw exception
+            EXPECT_TRUE(true);
+            v_try_void02.value();
+            EXPECT_TRUE(false);
+        } catch (const std::runtime_error& e) {
+            EXPECT_TRUE(true);
+        }
+        EXPECT_TRUE(b1);
+        EXPECT_TRUE(b2);
+
+        CHECK_EXECUTOR(&e2);
+    };
+    syncAwait(test4().via(&e2));
+
+    auto testCollectAllPara = [this, &e1]() -> Lazy<> {
+        Lazy<int> intLazy = getValue(2);
+        Lazy<double> doubleLazy = getValue(2.2);
+        Lazy<std::string> stringLazy =
+            getValue(std::string("testCollectAllPara"));
+        auto sleepLazy = [](int rep) -> Lazy<std::thread::id> {
+            std::this_thread::sleep_for(std::chrono::microseconds(rep));
+            co_return std::this_thread::get_id();
+        };
+
+        CHECK_EXECUTOR(&e1);
+        auto out_tuple = co_await collectAllPara(
+            std::move(intLazy), std::move(doubleLazy), std::move(stringLazy),
+            sleepLazy(2), sleepLazy(1));
+        CHECK_EXECUTOR(&e1);
+
+        EXPECT_EQ(5u, std::tuple_size<decltype(out_tuple)>::value);
+
+        auto [v_try_int, v_try_double, v_try_string, id0, id1] =
+            std::move(out_tuple);
+
+        EXPECT_EQ(2, v_try_int.value());
+        EXPECT_DOUBLE_EQ(2.2, v_try_double.value());
+        EXPECT_STREQ("testCollectAllPara", v_try_string.value().c_str());
+
+        CHECK_EXECUTOR(&e1);
+    };
+    syncAwait(testCollectAllPara().via(&e1));
 }
 
 TEST_F(LazyTest, testCollectAny) {
@@ -981,64 +1146,449 @@ TEST_F(LazyTest, testCollectAny) {
     executors::SimpleExecutor e3(10);
 
     auto test = [this]() -> Lazy<int> {
+        auto m = std::mutex{};
+        auto is_ready = bool{false};
+        auto cnt = int{};
+        auto cv = std::condition_variable{};
         std::vector<Lazy<int>> input;
-        input.push_back(getValueWithSleep(1));
-        input.push_back(getValueWithSleep(2));
-        input.push_back(getValueWithSleep(2));
-        input.push_back(getValueWithSleep(3));
-        input.push_back(getValueWithSleep(4));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(3));
-        input.push_back(getValueWithSleep(4));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(5));
-        input.push_back(getValueWithSleep(5));
+        input.push_back(getValueWithCV(1, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(2, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(3, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(4, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(5, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(6, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(7, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(8, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(9, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(10, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(11, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(12, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(13, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(14, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(15, cv, is_ready, cnt, m));
+        input.push_back(getValueWithSleep(16, 42ms));
+        input.push_back(getValueWithCV(17, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(18, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(19, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(20, cv, is_ready, cnt, m));
+        input.push_back(getValueWithCV(21, cv, is_ready, cnt, m));
+        cnt = input.size() - 1;
         auto combinedLazy = collectAny(std::move(input));
         auto out = co_await std::move(combinedLazy);
-        EXPECT_GT(out._value.value(), 0);
-        EXPECT_GE(out._idx, 0);
+        EXPECT_FALSE(out.hasError());
+        auto index = out.index();
+        auto& value = out.value();
+        EXPECT_EQ(out._value.value(), 16);
+        EXPECT_EQ(value, 16);
+        EXPECT_EQ(out._idx, 15u);
+        EXPECT_EQ(index, 15u);
+        {
+            std::unique_lock lk{m};
+            is_ready = true;
+            lk.unlock();
+            cv.notify_all();
+            lk.lock();
+            cv.wait(lk, [&] { return cnt == 0; });
+        }
         co_return out._value.value();
     };
-    ASSERT_GT(syncAwait(test().via(&e1)), 0);
+    ASSERT_EQ(syncAwait(test().via(&e1)), 16);
 
     auto test2 = [this, &e1, &e2, &e3]() -> Lazy<int> {
+        auto m = std::mutex{};
+        auto is_ready = bool{false};
+        auto cnt = int{};
+        auto cv = std::condition_variable{};
         std::vector<RescheduleLazy<int>> input;
-        input.push_back(getValueWithSleep(11).via(&e1));
-        input.push_back(getValueWithSleep(12).via(&e1));
-        input.push_back(getValueWithSleep(13).via(&e1));
-        input.push_back(getValueWithSleep(14).via(&e1));
-        input.push_back(getValueWithSleep(15).via(&e1));
-
-        input.push_back(getValueWithSleep(25).via(&e2));
-        input.push_back(getValueWithSleep(21).via(&e2));
-        input.push_back(getValueWithSleep(22).via(&e2));
-        input.push_back(getValueWithSleep(23).via(&e2));
-        input.push_back(getValueWithSleep(24).via(&e2));
-        input.push_back(getValueWithSleep(25).via(&e2));
-
+        input.push_back(getValueWithCV(1, cv, is_ready, cnt, m).via(&e1));
+        input.push_back(getValueWithCV(2, cv, is_ready, cnt, m).via(&e1));
+        input.push_back(getValueWithSleep(3, 65ms).via(&e1));
+        input.push_back(getValueWithCV(4, cv, is_ready, cnt, m).via(&e1));
+        input.push_back(getValueWithCV(5, cv, is_ready, cnt, m).via(&e1));
+        input.push_back(getValueWithCV(6, cv, is_ready, cnt, m).via(&e2));
+        input.push_back(getValueWithCV(7, cv, is_ready, cnt, m).via(&e2));
+        input.push_back(getValueWithCV(8, cv, is_ready, cnt, m).via(&e2));
+        input.push_back(getValueWithCV(9, cv, is_ready, cnt, m).via(&e2));
+        input.push_back(getValueWithCV(1, cv, is_ready, cnt, m).via(&e2));
+        input.push_back(getValueWithCV(1, cv, is_ready, cnt, m).via(&e2));
+        cnt = input.size() - 1;
         CHECK_EXECUTOR(&e3);
         auto combinedLazy = collectAny(std::move(input));
         CHECK_EXECUTOR(&e3);
 
         auto out = co_await std::move(combinedLazy);
 
-        EXPECT_GT(out._value.value(), 10);
-        EXPECT_GE(out._idx, 0);
+        EXPECT_EQ(out._value.value(), 3);
+        EXPECT_EQ(out._idx, 2u);
+        {
+            std::unique_lock lk{m};
+            is_ready = true;
+            lk.unlock();
+            cv.notify_all();
+            lk.lock();
+            cv.wait(lk, [&] { return cnt == 0; });
+        }
         co_return out._value.value();
     };
-    ASSERT_GT(syncAwait(test2().via(&e3)), 10);
+    ASSERT_EQ(syncAwait(test2().via(&e3)), 3);
+}
 
-    std::this_thread::sleep_for(chrono::seconds(2));
+TEST_F(LazyTest, testCollectAnyVariadic) {
+    srand((unsigned)time(NULL));
+    executors::SimpleExecutor e1(10);
+    executors::SimpleExecutor e2(10);
+    executors::SimpleExecutor e3(10);
+    auto test = [this]()
+        -> Lazy<std::variant<
+            async_simple::Try<short>, async_simple::Try<unsigned short>,
+            async_simple::Try<int>, async_simple::Try<unsigned int>,
+            async_simple::Try<long>, async_simple::Try<unsigned long>,
+            async_simple::Try<long long>,
+            async_simple::Try<unsigned long long>>> {
+        auto m = std::mutex{};
+        auto is_ready = bool{false};
+        auto cnt = int{7};
+        auto cv = std::condition_variable{};
+        auto combinedLazy = collectAny(
+            getValueWithCV((short)1, cv, is_ready, cnt, m),
+            getValueWithSleep((unsigned short)2),
+            getValueWithCV((int)3, cv, is_ready, cnt, m),
+            getValueWithCV((unsigned int)4, cv, is_ready, cnt, m),
+            getValueWithCV((long)5, cv, is_ready, cnt, m),
+            getValueWithCV((unsigned long)6, cv, is_ready, cnt, m),
+            getValueWithCV((long long)1, cv, is_ready, cnt, m),
+            getValueWithCV((unsigned long long)1, cv, is_ready, cnt, m));
+        auto out = co_await std::move(combinedLazy);
+        EXPECT_EQ(std::visit([](const auto& o) { return o.value() == 2; }, out),
+                  true);
+        {
+            std::unique_lock lk{m};
+            is_ready = true;
+            lk.unlock();
+            cv.notify_all();
+            lk.lock();
+            cv.wait(lk, [&] { return cnt == 0; });
+        }
+        co_return out;
+    };
+    ASSERT_EQ(std::visit([](const auto& o) { return o.value() == 2; },
+                         syncAwait(test().via(&e1))),
+              true);
+
+    auto test2 = [this, &e1, &e2, &e3]()
+        -> Lazy<std::variant<
+            async_simple::Try<short>, async_simple::Try<unsigned short>,
+            async_simple::Try<int>, async_simple::Try<unsigned int>,
+            async_simple::Try<long>, async_simple::Try<unsigned long>,
+            async_simple::Try<long long>,
+            async_simple::Try<unsigned long long>>> {
+        auto m = std::mutex{};
+        auto is_ready = bool{false};
+        auto cnt = int{7};
+        auto cv = std::condition_variable{};
+        CHECK_EXECUTOR(&e3);
+        auto combinedLazy = collectAny(
+            getValueWithCV((short)1, cv, is_ready, cnt, m).via(&e1),
+            getValueWithCV((unsigned short)2, cv, is_ready, cnt, m).via(&e1),
+            getValueWithCV((int)3, cv, is_ready, cnt, m).via(&e1),
+            getValueWithCV((unsigned int)4, cv, is_ready, cnt, m).via(&e1),
+            getValueWithCV((long)5, cv, is_ready, cnt, m).via(&e2),
+            getValueWithSleep((unsigned long)6, 50ms).via(&e2),
+            getValueWithCV((long long)7, cv, is_ready, cnt, m).via(&e2),
+            getValueWithCV((unsigned long long)8, cv, is_ready, cnt, m)
+                .via(&e2));
+        CHECK_EXECUTOR(&e3);
+        auto out = co_await std::move(combinedLazy);
+        EXPECT_EQ(std::visit([](const auto& o) { return o.value() == 6; }, out),
+                  true);
+        EXPECT_EQ(out.index(), 5u);
+        {
+            std::unique_lock lk{m};
+            is_ready = true;
+            lk.unlock();
+            cv.notify_all();
+            lk.lock();
+            cv.wait(lk, [&] { return cnt == 0; });
+        }
+        co_return out;
+    };
+
+    ASSERT_EQ(std::visit([](const auto& o) { return o.value() == 6; },
+                         syncAwait(test2().via(&e3))),
+              true);
+    using namespace std::chrono_literals;
+
+    auto test3 = [this, &e1, &e2, &e3]() -> Lazy<Try<std::vector<int>>> {
+        auto m = std::mutex{};
+        auto is_ready = bool{false};
+        auto cnt = int{4};
+        auto cv = std::condition_variable{};
+        CHECK_EXECUTOR(&e3);
+        auto combinedLazy = collectAny(
+            getValueWithCV(std::string("hello"), cv, is_ready, cnt, m).via(&e1),
+            getValueWithCV(std::string("hi"), cv, is_ready, cnt, m).via(&e1),
+            getValueWithSleep(std::vector<int>{1, 2, 3}, 50ms).via(&e1),
+            getValueWithCV(std::vector<double>{1.0f, 1.5f, 204.23f}, cv,
+                           is_ready, cnt, m)
+                .via(&e2),
+            getValueWithCV(std::set<int>{1, 2, 3}, cv, is_ready, cnt, m)
+                .via(&e2));
+        CHECK_EXECUTOR(&e3);
+        auto ret = co_await std::move(combinedLazy);
+        EXPECT_EQ(ret.index(), 2u);
+        auto out = std::get<2>(std::move(ret));
+        {
+            std::unique_lock lk{m};
+            is_ready = true;
+            lk.unlock();
+            cv.notify_all();
+            lk.lock();
+            cv.wait(lk, [&] { return cnt == 0; });
+        }
+        co_return out;
+    };
+    auto tmp = std::vector<int>{1, 2, 3};
+    auto out = syncAwait(test3().via(&e3));
+    ASSERT_EQ(out.available(), true);
+    ASSERT_EQ(out.value(), tmp);
+}
+
+struct mylocal : public LazyLocalBase {
+    mylocal(std::string sv) : LazyLocalBase(&tag), name(std::move(sv)) {}
+    std::string& hello() { return name; }
+    std::string name;
+    static bool classof(const LazyLocalBase* base) {
+        return base->getTypeTag() == &tag;
+    }
+    inline static char tag;
+};
+
+Lazy<bool> my_sleep_impl(std::chrono::milliseconds ms, SignalType expected_type,
+                         bool should_cancel = true,
+                         bool should_check_type = true) {
+    bool cancel = false;
+    auto l = co_await CurrentLazyLocals<mylocal>{};
+    EXPECT_TRUE(l->getSlot() != nullptr);
+    EXPECT_TRUE(l->hello() == "hello");
+    try {
+        co_await async_simple::coro::sleep(ms);
+    } catch (const async_simple::SignalException& err) {
+        assert(err.value() == async_simple::Terminate);
+        std::cout << err.what() + ",ms:"s + std::to_string(ms / 1ms)
+                  << std::endl;
+        cancel = true;
+    }
+    auto slot = co_await CurrentSlot{};
+    auto state = slot->signal()->state();
+    std::cout << "is cancel"s + std::to_string(cancel) + ", cancel type:"s +
+                     std::to_string(state) + "ms"s
+              << std::to_string(ms / 1ms) << std::endl;
+    if (cancel && should_check_type) {
+        if (expected_type != state) {
+            std::cout << "check type failed,ms:" + std::to_string(ms / 1ms)
+                      << std::endl;
+        }
+        EXPECT_EQ(expected_type, state);
+    }
+    if (should_cancel != cancel) {
+        std::cout << "no cancel error: ms:"s + std::to_string(ms / 1ms)
+                  << std::endl;
+    }
+    EXPECT_TRUE(should_cancel == cancel);
+    co_return cancel;
+};
+
+Lazy<bool> my_sleep(std::chrono::milliseconds ms, SignalType expected_type,
+                    bool should_cancel = true, bool should_check_type = true) {
+    return my_sleep_impl(ms, expected_type, should_cancel, should_check_type)
+        .setLazyLocal<mylocal>(std::string{"hello"});
+};
+
+TEST_F(LazyTest, testCollectAnyVariadicWithCancel) {
+    executors::SimpleExecutor e1(10);
+
+    []() -> Lazy<void> {
+        auto slot = co_await CurrentSlot{};
+        auto result = co_await collectAny<SignalType::All>(
+            collectAny<SignalType::Terminate>(my_sleep(500ms, SignalType::All),
+                                              my_sleep(100s, SignalType::All)),
+            collectAny<SignalType::Terminate>(
+                my_sleep(10ms, SignalType::Terminate, false),
+                my_sleep(5s, SignalType::Terminate, true, false)));
+        EXPECT_EQ(result.index(), 1);
+        auto slot2 = co_await CurrentSlot{};
+        EXPECT_EQ(slot, slot2);
+    }()
+                .via(&e1)
+                .detach();
+
+    []() -> Lazy<void> {
+        auto slot = co_await CurrentSlot{};
+        auto result = co_await collectAny<SignalType::None>(
+            collectAny<SignalType::Terminate>(
+                my_sleep(100ms, SignalType::None, false),
+                my_sleep(100s, SignalType::Terminate)),
+            collectAny<SignalType::None>(
+                my_sleep(10ms, SignalType::None, false),
+                my_sleep(200ms, SignalType::None, false)));
+        EXPECT_EQ(result.index(), 1);
+        auto slot2 = co_await CurrentSlot{};
+        EXPECT_EQ(slot, slot2);
+    }()
+                .via(&e1)
+                .detach();
+    []() -> Lazy<void> {
+        auto slot = co_await CurrentSlot{};
+        auto result = co_await collectAny<SignalType::Terminate>(
+            collectAny<SignalType::None>(my_sleep(100ms, SignalType::Terminate),
+                                         my_sleep(100s, SignalType::Terminate)),
+            collectAny<SignalType::None>(
+                my_sleep(10ms, SignalType::None, false),
+                my_sleep(200ms, SignalType::Terminate)));
+        EXPECT_EQ(result.index(), 1);
+        auto slot2 = co_await CurrentSlot{};
+        EXPECT_EQ(slot, slot2);
+    }()
+                .via(&e1)
+                .detach();
+    std::this_thread::sleep_for(500ms);
+}
+
+TEST_F(LazyTest, testCollectAnyWithCancel) {
+    executors::SimpleExecutor e1(10);
+
+    []() -> Lazy<void> {
+        auto slot = co_await CurrentSlot{};
+        std::vector<Lazy<bool>> v1, v2;
+        v1.push_back(my_sleep(500ms, SignalType::All));
+        v1.push_back(my_sleep(100s, SignalType::All));
+        v2.push_back(my_sleep(10ms, SignalType::Terminate, false));
+        v2.push_back(my_sleep(5s, SignalType::Terminate, true, false));
+        std::vector<Lazy<detail::CollectAnyResult<bool>>> v3;
+        v3.push_back(collectAny<SignalType::Terminate>(std::move(v1)));
+        v3.push_back(collectAny<SignalType::Terminate>(std::move(v2)));
+        auto result = co_await collectAny<SignalType::All>(std::move(v3));
+        EXPECT_EQ(result.index(), 1);
+        auto slot2 = co_await CurrentSlot{};
+        EXPECT_EQ(slot, slot2);
+    }()
+                .via(&e1)
+                .detach();
+    []() -> Lazy<void> {
+        auto slot = co_await CurrentSlot{};
+        std::vector<Lazy<bool>> v1, v2;
+        v1.push_back(my_sleep(100ms, SignalType::None, false));
+        v1.push_back(my_sleep(100s, SignalType::Terminate));
+        v2.push_back(my_sleep(10ms, SignalType::None, false));
+        v2.push_back(my_sleep(200ms, SignalType::None, false));
+        std::vector<Lazy<detail::CollectAnyResult<bool>>> v3;
+        v3.push_back(collectAny<SignalType::Terminate>(std::move(v1)));
+        v3.push_back(collectAny<SignalType::None>(std::move(v2)));
+        auto result = co_await collectAny<SignalType::None>(std::move(v3));
+        EXPECT_EQ(result.index(), 1);
+        auto slot2 = co_await CurrentSlot{};
+        EXPECT_EQ(slot, slot2);
+    }()
+                .via(&e1)
+                .detach();
+    []() -> Lazy<void> {
+        auto slot = co_await CurrentSlot{};
+        std::vector<Lazy<bool>> v1, v2;
+        v1.push_back(my_sleep(100ms, SignalType::Terminate));
+        v1.push_back(my_sleep(100s, SignalType::Terminate));
+        v2.push_back(my_sleep(10ms, SignalType::None, false));
+        v2.push_back(my_sleep(200ms, SignalType::Terminate));
+        std::vector<Lazy<detail::CollectAnyResult<bool>>> v3;
+        v3.push_back(collectAny<SignalType::Terminate>(std::move(v1)));
+        v3.push_back(collectAny<SignalType::None>(std::move(v2)));
+        auto result = co_await collectAny<SignalType::Terminate>(std::move(v3));
+        EXPECT_EQ(result.index(), 1);
+        auto slot2 = co_await CurrentSlot{};
+        EXPECT_EQ(slot, slot2);
+    }()
+                .via(&e1)
+                .detach();
+    std::this_thread::sleep_for(500ms);
+}
+
+TEST_F(LazyTest, testCollectAllVaradicWithCancel) {
+    executors::SimpleExecutor e1(10);
+    syncAwait([]() -> Lazy<void> {
+        auto slot = co_await CurrentSlot{};
+        auto result = co_await collectAll<SignalType::None>(
+            collectAll<SignalType::All>(
+                my_sleep(100ms, SignalType::None, false),
+                my_sleep(100s, SignalType::All)),
+            collectAll<SignalType::Terminate>(
+                my_sleep(10ms, SignalType::Terminate, false),
+                my_sleep(200ms, SignalType::Terminate)));
+        EXPECT_EQ(std::get<0>(std::get<0>(result).value()).value(), false);
+        EXPECT_EQ(std::get<1>(std::get<0>(result).value()).value(), true);
+        EXPECT_EQ(std::get<0>(std::get<1>(result).value()).value(), false);
+        EXPECT_EQ(std::get<1>(std::get<1>(result).value()).value(), true);
+        auto slot2 = co_await CurrentSlot{};
+        EXPECT_EQ(slot, slot2);
+    }()
+                          .via(&e1));
+    syncAwait([]() -> Lazy<void> {
+        auto slot = co_await CurrentSlot{};
+        auto result = co_await collectAll<SignalType::None>(
+            collectAll<SignalType::All>(
+                my_sleep(100ms, SignalType::None, false),
+                my_sleep(100s, SignalType::All)),
+            collectAll<SignalType::Terminate>(
+                my_sleep(10ms, SignalType::Terminate, false),
+                my_sleep(200ms, SignalType::Terminate)));
+        EXPECT_EQ(std::get<0>(std::get<0>(result).value()).value(), false);
+        EXPECT_EQ(std::get<1>(std::get<0>(result).value()).value(), true);
+        EXPECT_EQ(std::get<0>(std::get<1>(result).value()).value(), false);
+        EXPECT_EQ(std::get<1>(std::get<1>(result).value()).value(), true);
+        auto slot2 = co_await CurrentSlot{};
+        EXPECT_EQ(slot, slot2);
+    }()
+                          .via(&e1));
+}
+
+TEST_F(LazyTest, testCollectAllWithCancel) {
+    executors::SimpleExecutor e1(10);
+    syncAwait([]() -> Lazy<void> {
+        auto slot = co_await CurrentSlot{};
+        std::vector<Lazy<bool>> v1, v2;
+        v1.push_back(my_sleep(100ms, SignalType::None, false));
+        v1.push_back(my_sleep(100s, SignalType::All));
+        v2.push_back(my_sleep(10ms, SignalType::Terminate, false));
+        v2.push_back(my_sleep(200ms, SignalType::Terminate));
+        std::vector<Lazy<std::vector<Try<bool>>>> v3;
+        v3.push_back(collectAll<SignalType::All>(std::move(v1)));
+        v3.push_back(collectAll<SignalType::Terminate>(std::move(v2)));
+        auto result = co_await collectAll<SignalType::None>(std::move(v3));
+        EXPECT_EQ(result[0].value()[0].value(), false);
+        EXPECT_EQ(result[0].value()[1].value(), true);
+        EXPECT_EQ(result[1].value()[0].value(), false);
+        EXPECT_EQ(result[1].value()[1].value(), true);
+        auto slot2 = co_await CurrentSlot{};
+        EXPECT_EQ(slot, slot2);
+    }()
+                          .via(&e1));
+    syncAwait([]() -> Lazy<void> {
+        auto slot = co_await CurrentSlot{};
+        std::vector<Lazy<bool>> v1, v2;
+        v1.push_back(my_sleep(500ms, SignalType::Terminate, true, false));
+        v1.push_back(my_sleep(100s, SignalType::Terminate, true, false));
+        v2.push_back(my_sleep(10ms, SignalType::None, false));
+        v2.push_back(my_sleep(100ms, SignalType::None, false));
+        std::vector<Lazy<std::vector<Try<bool>>>> v3;
+        v3.push_back(collectAll<SignalType::All>(std::move(v1)));
+        v3.push_back(collectAll<SignalType::None>(std::move(v2)));
+        auto result = co_await collectAll<SignalType::Terminate>(std::move(v3));
+        EXPECT_EQ(result[0].value()[0].value(), true);
+        EXPECT_EQ(result[0].value()[1].value(), true);
+        EXPECT_EQ(result[1].value()[0].value(), false);
+        EXPECT_EQ(result[1].value()[1].value(), false);
+        auto slot2 = co_await CurrentSlot{};
+        EXPECT_EQ(slot, slot2);
+    }()
+                          .via(&e1));
 }
 
 TEST_F(LazyTest, testException) {
@@ -1076,10 +1626,10 @@ TEST_F(LazyTest, testContext) {
     executors::SimpleExecutor e2(10);
 
     auto addTwo = [&](int x) -> Lazy<int> {
-        CHECK_EXECUTOR(&e2);
+        CHECK_EXECUTOR(&e1);
         auto tid = std::this_thread::get_id();
         auto tmp = co_await getValue(x);
-        CHECK_EXECUTOR(&e2);
+        CHECK_EXECUTOR(&e1);
         EXPECT_EQ(tid, std::this_thread::get_id());
         co_return tmp + 2;
     };
@@ -1092,34 +1642,15 @@ TEST_F(LazyTest, testContext) {
             int y = co_await plusOne();
             CHECK_EXECUTOR(&e1);
             EXPECT_EQ(tid, std::this_thread::get_id());
-            int z = co_await addTwo(y).via(&e2);
+            auto z = co_await addTwo(y).coAwaitTry();
             CHECK_EXECUTOR(&e1);
             EXPECT_EQ(tid, std::this_thread::get_id());
-            co_return z;
+            co_return z.value();
         };
         triggerValue(100);
         auto val = syncAwait(test().via(&e1));
         ASSERT_EQ(103, val);
     }
-}
-
-template <bool Ready>
-typename detail::CoroTypeTraits<int, Ready>::TaskType bar() {
-    co_return 3;
-}
-
-template <bool Ready>
-typename detail::CoroTypeTraits<int, Ready>::TaskType foo() {
-    co_return co_await bar<Ready>() + 1 + co_await bar<!Ready>();
-}
-
-TEST_F(LazyTest, testZ) {
-    auto test = []() -> Lazy<int> {
-        auto a = co_await foo<true>();
-        a += co_await foo<false>();
-        co_return a;
-    };
-    ASSERT_EQ(14, syncAwait(test().via(&_executor)));
 }
 
 struct A {
@@ -1145,7 +1676,7 @@ Lazy<int> getValue(A x) {
         ValueAwaiter(int v) : value(v) {}
 
         bool await_ready() { return false; }
-        void await_suspend(STD_CORO::coroutine_handle<> continuation) noexcept {
+        void await_suspend(std::coroutine_handle<> continuation) noexcept {
             std::thread([c = std::move(continuation)]() mutable {
                 c.resume();
             }).detach();
@@ -1182,7 +1713,7 @@ TEST_F(LazyTest, testDestroyOrder) {
         co_return v;
     };
     syncAwait(test().via(&_executor));
-    EXPECT_THAT(A::destroyOrder, ElementsAre(1, 7, 1, 0, 999));
+    EXPECT_THAT(A::destroyOrder, testing::ElementsAre(1, 7, 1, 0, 999));
 }
 
 namespace detail {
@@ -1197,7 +1728,16 @@ Lazy<int> lazy_fn<0>() {
 }
 }  // namespace detail
 TEST_F(LazyTest, testLazyPerf) {
+    // The code compiled by GCC with Debug would fail
+    // if test_loop is 5000.
+#ifndef NDEBUG
+    auto test_loop = 50;
+    auto expected_sum = 23250;
+#else
     auto test_loop = 5000;
+    auto expected_sum = 2325000;
+#endif
+
     auto total = 0;
 
     auto one = [](int n) -> Lazy<int> {
@@ -1214,7 +1754,7 @@ TEST_F(LazyTest, testLazyPerf) {
         }
     };
     syncAwait(loop_starter());
-    ASSERT_EQ(total, 2325000);
+    ASSERT_EQ(total, expected_sum);
 
     total = 0;
     auto chain_starter = [&]() -> Lazy<> {
@@ -1224,7 +1764,7 @@ TEST_F(LazyTest, testLazyPerf) {
         }
     };
     syncAwait(chain_starter());
-    ASSERT_EQ(total, 2325000);
+    ASSERT_EQ(total, expected_sum);
 }
 
 TEST_F(LazyTest, testcollectAllParallel) {
@@ -1277,14 +1817,14 @@ TEST_F(LazyTest, testcollectAllParallel) {
         ss.insert(out[6].value());
         ss.insert(out[7].value());
         // FIXME: input tasks maybe run not in different thread.
-        EXPECT_GT(ss.size(), 2);
+        EXPECT_GT(ss.size(), 2u);
     };
     syncAwait(test2().via(&e1));
 }
 
 std::vector<int> result;
 Lazy<void> makeTest(int value) {
-    usleep(1000);
+    std::this_thread::sleep_for(1000us);
     result.push_back(value);
     co_return;
 }
@@ -1322,7 +1862,7 @@ TEST_F(LazyTest, testBatchedcollectAll) {
         ss.insert(out[5].value());
         ss.insert(out[6].value());
         // FIXME: input tasks maybe run not in different thread.
-        EXPECT_GT(ss.size(), 1);
+        EXPECT_GT(ss.size(), 1u);
     };
     syncAwait(test1().via(&e1));
 
@@ -1356,12 +1896,149 @@ TEST_F(LazyTest, testBatchedcollectAll) {
     collectAllWindowed(1, true, std::move(input2))
         .via(&e2)
         .start([](auto result) {});
-    usleep(500000);
+    std::this_thread::sleep_for(500000us);
     std::vector<int> expect{1, 5, 2, 6, 3, 7, 4, 8};
     for (size_t i = 0; i < result.size(); ++i) {
         EXPECT_EQ(expect[i], result[i]);
         std::cout << "expect[" << i << "]: " << expect[i] << ", "
                   << "result[" << i << "]: " << result[i] << std::endl;
+    }
+}
+
+TEST_F(LazyTest, testDetach) {
+    util::Condition cond;
+    int count = 0;
+    executors::SimpleExecutor e1(1);
+    auto test1 = [](util::Condition& cond, int& count) -> Lazy<> {
+        count += 2;
+        cond.release();
+        co_return;
+    };
+    test1(cond, count).via(&e1).detach();
+    cond.acquire();
+    EXPECT_EQ(count, 2);
+}
+
+async_simple::coro::Lazy<int> yield_waiter(std::atomic_bool& yieldflag) {
+    int counter = 0;
+    while (!yieldflag) {
+        ++counter;
+        co_await async_simple::coro::Yield{};
+    }
+    co_return counter;
+}
+async_simple::coro::Lazy<void> yield_notifyer(std::atomic_bool& yieldflag) {
+    using namespace std::chrono_literals;
+    co_await async_simple::coro::sleep(10ms);
+    yieldflag = true;
+}
+async_simple::coro::Lazy<void> testYieldNoDeadLock(async_simple::Executor* ex) {
+    std::atomic_bool _yieldflag;
+    auto [cnt, _] = co_await async_simple::coro::collectAll(
+        yield_waiter(_yieldflag).via(ex), yield_notifyer(_yieldflag).via(ex));
+}
+
+TEST_F(LazyTest, testYieldNoDeadLockWithSimpleExecutor) {
+    syncAwait(testYieldNoDeadLock(&_executor));
+}
+
+TEST_F(LazyTest, testLazyWithEmptySignalSlot) {
+    syncAwait([]() -> Lazy<void> {
+        auto slot = co_await CurrentSlot{};
+        EXPECT_EQ(slot, nullptr);
+        co_await ForbidSignal{};
+        slot = co_await CurrentSlot{};
+        EXPECT_EQ(slot, nullptr);
+        co_return;
+    }());
+}
+
+TEST_F(LazyTest, testLazyWithSignalSlot) {
+    auto signal = Signal::create();
+    auto ptr = signal.get();
+    auto observer = std::weak_ptr<Signal>(signal);
+    auto lazy = [](std::shared_ptr<Signal> signal,
+                   std::weak_ptr<Signal> observer) -> Lazy<void> {
+        signal = nullptr;
+        auto slot = co_await CurrentSlot{};
+        EXPECT_NE(slot, nullptr);
+        EXPECT_EQ(observer.expired(), false);
+        EXPECT_EQ(slot->signal(), observer.lock().get());
+        co_await ForbidSignal{};
+        slot = co_await CurrentSlot{};
+        EXPECT_EQ(slot, nullptr);
+        EXPECT_EQ(observer.expired(), true);
+        co_return;
+    }(std::move(signal), observer)
+                                                          .setLazyLocal(ptr);
+    syncAwait(std::move(lazy));
+    EXPECT_EQ(observer.expired(), true);
+}
+
+TEST_F(LazyTest, testNestedLazyWithSignalSlot) {
+    auto signal = Signal::create();
+    auto ptr = signal.get();
+    auto observer = std::weak_ptr<Signal>(signal);
+    auto lazy = [](std::shared_ptr<Signal> signal,
+                   std::weak_ptr<Signal> observer) -> Lazy<void> {
+        signal = nullptr;
+        auto slot = co_await CurrentSlot{};
+        EXPECT_NE(slot, nullptr);
+        EXPECT_EQ(observer.expired(), false);
+        EXPECT_EQ(slot->signal(), observer.lock().get());
+        co_await [](std::weak_ptr<Signal> observer) -> Lazy<void> {
+            auto slot = co_await CurrentSlot{};
+            EXPECT_NE(slot, nullptr);
+            EXPECT_EQ(observer.expired(), false);
+            EXPECT_EQ(slot->signal(), observer.lock().get());
+            co_await ForbidSignal{};
+            slot = co_await CurrentSlot{};
+            EXPECT_EQ(slot, nullptr);
+            EXPECT_EQ(observer.expired(), true);
+        }(observer);
+        slot = co_await CurrentSlot{};
+        EXPECT_EQ(slot, nullptr);
+        EXPECT_EQ(observer.expired(), true);
+        co_return;
+    }(std::move(signal), observer)
+                                                          .setLazyLocal(ptr);
+    signal = nullptr;
+    syncAwait(std::move(lazy));
+    EXPECT_EQ(observer.expired(), true);
+}
+
+TEST_F(LazyTest, testForbiddenCancel) {
+    executors::SimpleExecutor e(1);
+    {
+        auto signal = Signal::create();
+        async_simple::Promise<void> p;
+        auto lazy = [](async_simple::Future<void> f) -> Lazy<void> {
+            auto slot = co_await CurrentSlot{};
+            EXPECT_NE(slot, nullptr);
+            co_await std::move(f);
+            EXPECT_TRUE(slot->canceled());
+            EXPECT_EQ(slot->signal()->state(), SignalType::Terminate);
+        };
+        lazy(p.getFuture()).setLazyLocal(signal.get()).via(&e).detach();
+        signal->emit(SignalType::Terminate);
+        p.setValue();
+    }
+    {
+        auto signal = Signal::create();
+        async_simple::Promise<void> p;
+        auto lazy = [](async_simple::Future<void> f) -> Lazy<void> {
+            auto slot = co_await CurrentSlot{};
+            EXPECT_NE(slot, nullptr);
+            co_await ForbidSignal{};
+            slot = co_await CurrentSlot{};
+            EXPECT_EQ(slot, nullptr);
+            co_await std::move(f);
+            slot = co_await CurrentSlot{};
+            EXPECT_EQ(slot, nullptr);
+        };
+        lazy(p.getFuture()).setLazyLocal(signal.get()).via(&e).detach();
+        signal->emit(SignalType::Terminate);
+        p.setValue();
     }
 }
 

@@ -6,10 +6,11 @@ build_options.*
 config.log
 *.o
 build/
-build*
+build*/
 _external/
 core.*
 \#*\#
+!.github
 !.gitignore
 !.clang-format
 *.so
@@ -24,3 +25,15 @@ error_log_collector.log
 coro_trace.log
 *.log
 test.h
+bazel-*
+!.bazelignore
+!.bazelrc
+cmake-build-debug
+!docs/.vitepress
+docs/.vitepress/cache
+docs/public
+node_modules
+compile_commands.json
+
+# Ignore Bzlmod lock file until it is more stable
+MODULE.bazel.lock

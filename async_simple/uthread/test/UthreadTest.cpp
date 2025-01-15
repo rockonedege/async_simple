@@ -13,20 +13,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <async_simple/Common.h>
-#include <async_simple/coro/Lazy.h>
-#include <async_simple/executors/SimpleExecutor.h>
-#include <async_simple/test/unittest.h>
-#include <async_simple/uthread/Async.h>
-#include <async_simple/uthread/Await.h>
-#include <async_simple/uthread/Collect.h>
-#include <async_simple/uthread/Latch.h>
-#include <async_simple/uthread/Uthread.h>
-#include <unistd.h>
 #include <exception>
 #include <functional>
 #include <iostream>
 #include <type_traits>
+#include "async_simple/Common.h"
+#include "async_simple/coro/Lazy.h"
+#include "async_simple/executors/SimpleExecutor.h"
+#include "async_simple/test/unittest.h"
+#include "async_simple/uthread/Async.h"
+#include "async_simple/uthread/Await.h"
+#include "async_simple/uthread/Collect.h"
+#include "async_simple/uthread/Latch.h"
+#include "async_simple/uthread/Uthread.h"
 
 using namespace std;
 
@@ -58,13 +57,11 @@ public:
         Awaiter(Executor* e, T v) : ex(e), value(v) {}
 
         bool await_ready() { return false; }
-        void await_suspend(STD_CORO::coroutine_handle<> handle) noexcept {
+        void await_suspend(std::coroutine_handle<> handle) noexcept {
             auto ctx = ex->checkout();
             std::thread([handle, e = ex, ctx]() mutable {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                Executor::Func f = [handle, ctx = std::move(ctx)]() mutable {
-                    handle.resume();
-                };
+                Executor::Func f = [handle]() mutable { handle.resume(); };
                 e->checkin(std::move(f), ctx);
             }).detach();
         }
@@ -121,22 +118,20 @@ TEST_F(UthreadTest, testSwitch) {
 
     std::atomic<int> running = 2;
     _executor.schedule([ex, &running, &show, &ioJob]() mutable {
-        Uthread task1(Attribute{ex}, [&running, &show, &ioJob]() {
+        Uthread task1(Attribute{ex}, [&show, &ioJob]() {
             show("task1 start");
-            auto value = ioJob().get();
+            auto value = await(ioJob());
             EXPECT_EQ(1024, value);
             show("task1 done");
-            running--;
         });
-        task1.detach();
+        task1.join([&running]() { running--; });
     });
     _executor.schedule([ex, &running, &show]() mutable {
-        Uthread task2(Attribute{ex}, [&running, &show]() {
+        Uthread task2(Attribute{ex}, [&show]() {
             show("task2 start");
             show("task2 done");
-            running--;
         });
-        task2.detach();
+        task2.join([&running]() { running--; });
     });
 
     while (running) {
@@ -150,25 +145,30 @@ public:
 
 public:
     bool currentThreadInExecutor() const override { return true; }
+    Context checkout() override { return NULLCTX; }
     bool checkin(Func func, Context ctx, ScheduleOptions opts) override {
         return schedule(std::move(func));
     }
 };
 
+// reschedule uthread to two different executor is not thread-safe
+// this case used to check uthread's continuation switched in a new thread
+// successfully. detail see: jump_buf_link::switch_in
 TEST_F(UthreadTest, testScheduleInTwoThread) {
-    Executor* ex = &_executor;
-    FakeExecutor fakeEx(6);
-    Executor* newEx = &fakeEx;
+    auto ex = std::make_unique<executors::SimpleExecutor>(1);
+    FakeExecutor fakeEx(1);
     auto show = [&](const std::string& message) mutable {
         std::cout << message << std::endl;
     };
 
     auto ioJob = [&]() -> Future<int> {
         Promise<int> p;
-        auto f = p.getFuture().via(newEx);
+        auto f = p.getFuture().via(&fakeEx);
         delayedTask(
-            [p = std::move(p)]() mutable {
+            [p = std::move(p), &ex]() mutable {
                 auto value = 1024;
+                // wait task done, avoid data race
+                ex.reset();
                 p.setValue(value);
             },
             1000);
@@ -176,15 +176,15 @@ TEST_F(UthreadTest, testScheduleInTwoThread) {
     };
 
     std::atomic<int> running = 1;
-    ex->schedule([ex, &running, &show, &ioJob]() mutable {
-        Uthread task(Attribute{ex}, [&running, &show, &ioJob]() {
+    ex->schedule([ex = &fakeEx, &running, &show, &ioJob]() mutable {
+        Uthread task(Attribute{ex}, [&show, &ioJob]() {
             show("task start");
-            auto value = ioJob().get();
+            auto value = await(ioJob());
             EXPECT_EQ(1024, value);
             show("task done");
-            running--;
         });
-        task.detach();
+        task.join([&running]() { running--; });
+        ;
     });
 
     while (running) {
@@ -210,23 +210,17 @@ TEST_F(UthreadTest, testAsync) {
     };
 
     std::atomic<int> running = 2;
-    async<Launch::Schedule>(
-        [&running, &show, &ioJob]() {
-            show("task1 start");
-            auto value = ioJob().get();
-            EXPECT_EQ(1024, value);
-            show("task1 done");
-            running--;
-        },
-        ex);
-    async<Launch::Schedule>(
-        [&running, &show, ex]() {
-            show("task2 start");
-            async<Launch::Prompt>([&show]() { show("task3"); }, ex).detach();
-            show("task2 done");
-            running--;
-        },
-        ex);
+    async(Launch::Schedule, Attribute{ex}, [&show, &ioJob]() {
+        show("task1 start");
+        auto value = await(ioJob());
+        EXPECT_EQ(1024, value);
+        show("task1 done");
+    }).thenValue([&running]() { running--; });
+    async(Launch::Schedule, Attribute{ex}, [&show, ex]() {
+        show("task2 start");
+        Uthread(Attribute{ex}, [&show]() { show("task3"); }).detach();
+        show("task2 done");
+    }).thenValue([&running]() { running--; });
 
     while (running) {
     }
@@ -248,23 +242,17 @@ TEST_F(UthreadTest, testAwait) {
     };
 
     std::atomic<int> running = 2;
-    async<Launch::Schedule>(
-        [&running, &show, &ioJob, ex]() {
-            show("task1 start");
-            auto value = await<int>(ex, ioJob);
-            EXPECT_EQ(1024, value);
-            show("task1 done");
-            running--;
-        },
-        ex);
-    async<Launch::Schedule>(
-        [&running, &show, ex]() {
-            show("task2 start");
-            async<Launch::Prompt>([&show]() { show("task3"); }, ex).detach();
-            show("task2 done");
-            running--;
-        },
-        ex);
+    async(Launch::Schedule, Attribute{ex}, [&show, &ioJob, ex]() {
+        show("task1 start");
+        auto value = await<int>(ex, ioJob);
+        EXPECT_EQ(1024, value);
+        show("task1 done");
+    }).thenValue([&running]() { running--; });
+    async(Launch::Schedule, Attribute{ex}, [&show, ex]() {
+        show("task2 start");
+        Uthread(Attribute{ex}, [&show]() { show("task3"); }).detach();
+        show("task2 done");
+    }).thenValue([&running]() { running--; });
 
     while (running) {
     }
@@ -277,25 +265,55 @@ TEST_F(UthreadTest, testAwaitCoroutine) {
     };
 
     std::atomic<int> running = 2;
-    async<Launch::Schedule>(
-        [&running, &show, ex, this]() mutable {
-            show("task1 start");
-            auto value =
-                await(ex, &std::remove_pointer_t<decltype(this)>::lazySum<int>,
-                      this, 1000, 24);
-            EXPECT_EQ(1024, value);
-            show("task1 done");
-            running--;
-        },
-        ex);
-    async<Launch::Schedule>(
-        [&running, &show, ex]() {
-            show("task2 start");
-            async<Launch::Prompt>([&show]() { show("task3"); }, ex).detach();
-            show("task2 done");
-            running--;
-        },
-        ex);
+    async(Launch::Schedule, Attribute{ex}, [&show, ex, this]() mutable {
+        show("task1 start");
+        auto value =
+            await(ex, &std::remove_pointer_t<decltype(this)>::lazySum<int>,
+                  this, 1000, 24);
+        EXPECT_EQ(1024, value);
+        show("task1 done");
+    }).thenValue([&running]() { running--; });
+    async(Launch::Schedule, Attribute{ex}, [&show, ex]() {
+        show("task2 start");
+        Uthread(Attribute{ex}, [&show]() { show("task3"); }).detach();
+        show("task2 done");
+    }).thenValue([&running]() { running--; });
+
+    while (running) {
+    }
+}
+
+coro::Lazy<> testSimpleFunction(const std::string& message) { co_return; }
+
+TEST_F(UthreadTest, testAwaitCoroutineRetrunVoid) {
+    Executor* ex = &_executor;
+    auto show = [&](const std::string& message) mutable {
+        std::cout << message << "\n";
+    };
+
+    std::atomic<int> running = 2;
+    async(Launch::Schedule, Attribute{ex}, [&show, ex]() mutable {
+        show("task1 start");
+        auto lazy = [](const std::string& message) -> coro::Lazy<> {
+            co_return;
+        };
+        await(ex, lazy, "test lambda");
+        await(ex, testSimpleFunction, "test function name");
+        await(ex, &testSimpleFunction, "test function address");
+        await(ex, std::bind(testSimpleFunction, "test Bind"));
+        show("task1 done");
+    }).thenValue([&running]() { running--; });
+    async(Launch::Schedule, Attribute{ex}, [&show, ex]() {
+        show("task2 start");
+        struct Test {
+            coro::Lazy<> operator()(const std::string& message) { co_return; }
+        };
+        Test t;
+        await(ex, t, "test functor");
+        await(ex, &Test::operator(), &t, "test member method");
+        Uthread(Attribute{ex}, [&show]() { show("task3"); }).detach();
+        show("task2 done");
+    }).thenValue([&running]() { running--; });
 
     while (running) {
     }
@@ -311,13 +329,11 @@ struct Awaiter {
     Awaiter(Executor* e, T v) : ex(e), value(v) {}
 
     bool await_ready() { return false; }
-    void await_suspend(STD_CORO::coroutine_handle<> handle) noexcept {
+    void await_suspend(std::coroutine_handle<> handle) noexcept {
         auto ctx = ex->checkout();
         std::thread([handle, e = ex, ctx]() mutable {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            Executor::Func f = [handle, ctx = std::move(ctx)]() mutable {
-                handle.resume();
-            };
+            Executor::Func f = [handle]() mutable { handle.resume(); };
             e->checkin(std::move(f), ctx);
         }).detach();
     }
@@ -337,28 +353,24 @@ TEST_F(UthreadTest, testAwaitCoroutineNoneMemFn) {
     };
 
     std::atomic<int> running = 2;
-    async<Launch::Schedule>(
-        [&running, &show, ex]() mutable {
-            show("task1 start");
-            auto value = await(ex, globalfn::lazySum<int>, ex, 1000, 24);
-            EXPECT_EQ(1024, value);
-            show("task1 done");
-            running--;
-        },
-        ex);
+    async(Launch::Schedule, Attribute{ex}, [&show, ex]() mutable {
+        show("task1 start");
+        auto value = await(ex, globalfn::lazySum<int>, ex, 1000, 24);
+        EXPECT_EQ(1024, value);
+        show("task1 done");
+    }).thenValue([&running]() { running--; });
 
     auto lazySumWrapper = [ex = &_executor]() -> coro::Lazy<int> {
         co_return co_await globalfn::lazySum(ex, 1000, 24);
     };
-    async<Launch::Schedule>(
-        [&running, &show, ex, &lazySumWrapper]() mutable {
-            show("task2 start");
-            auto value = await(ex, lazySumWrapper);
-            EXPECT_EQ(1024, value);
-            show("task2 done");
-            running--;
-        },
-        ex);
+    async(Launch::Schedule, Attribute{ex},
+          [&show, ex, &lazySumWrapper]() mutable {
+              show("task2 start");
+              auto value = await(ex, lazySumWrapper);
+              EXPECT_EQ(1024, value);
+              show("task2 done");
+          })
+        .thenValue([&running]() { running--; });
 
     while (running) {
     }
@@ -379,13 +391,12 @@ TEST_F(UthreadTest, testCollectAllSimple) {
     }
 
     std::atomic<int> running = 1;
-    async<Launch::Schedule>(
-        [&running, &n, ex, fs = std::move(fs)]() mutable {
-            collectAll<Launch::Schedule>(fs.begin(), fs.end(), ex);
-            EXPECT_EQ(0, n);
-            running--;
-        },
-        ex);
+    async(Launch::Schedule, Attribute{ex},
+          [&n, ex, fs = std::move(fs)]() mutable {
+              collectAll<Launch::Schedule>(fs.begin(), fs.end(), ex);
+              EXPECT_EQ(0u, n);
+          })
+        .thenValue([&running]() { running--; });
 
     while (running) {
     }
@@ -410,21 +421,18 @@ TEST_F(UthreadTest, testCollectAllSlow) {
     std::vector<std::function<std::size_t()>> fs;
     for (size_t i = 0; i < kMaxTask; ++i) {
         fs.emplace_back([i, &ioJob]() -> std::size_t {
-            return i + ioJob(kMaxTask - i).get();
+            return i + await(ioJob(kMaxTask - i));
         });
     }
 
     std::atomic<int> running = 1;
-    async<Launch::Schedule>(
-        [&running, ex, fs = std::move(fs)]() mutable {
-            auto res = collectAll<Launch::Schedule>(fs.begin(), fs.end(), ex);
-            EXPECT_EQ(kMaxTask, res.size());
-            for (size_t i = 0; i < kMaxTask; ++i) {
-                EXPECT_EQ(i + 1024, res[i]);
-            }
-            running--;
-        },
-        ex);
+    async(Launch::Schedule, Attribute{ex}, [ex, fs = std::move(fs)]() mutable {
+        auto res = collectAll<Launch::Schedule>(fs.begin(), fs.end(), ex);
+        EXPECT_EQ(kMaxTask, res.size());
+        for (size_t i = 0; i < kMaxTask; ++i) {
+            EXPECT_EQ(i + 1024, res[i]);
+        }
+    }).thenValue([&running]() { running--; });
 
     while (running) {
     }
@@ -449,21 +457,18 @@ TEST_F(UthreadTest, testCollectAllSlowSingleThread) {
     std::vector<std::function<std::size_t()>> fs;
     for (size_t i = 0; i < kMaxTask; ++i) {
         fs.emplace_back([i, &ioJob]() -> std::size_t {
-            return i + ioJob(kMaxTask - i).get();
+            return i + await(ioJob(kMaxTask - i));
         });
     }
 
     std::atomic<int> running = 1;
-    async<Launch::Schedule>(
-        [&running, ex, fs = std::move(fs)]() mutable {
-            auto res = collectAll<Launch::Current>(fs.begin(), fs.end(), ex);
-            EXPECT_EQ(kMaxTask, res.size());
-            for (size_t i = 0; i < kMaxTask; ++i) {
-                EXPECT_EQ(i + 1024, res[i]);
-            }
-            running--;
-        },
-        ex);
+    async(Launch::Schedule, Attribute{ex}, [ex, fs = std::move(fs)]() mutable {
+        auto res = collectAll<Launch::Current>(fs.begin(), fs.end(), ex);
+        EXPECT_EQ(kMaxTask, res.size());
+        for (size_t i = 0; i < kMaxTask; ++i) {
+            EXPECT_EQ(i + 1024, res[i]);
+        }
+    }).thenValue([&running]() { running--; });
 
     while (running) {
     }
@@ -483,16 +488,15 @@ TEST_F(UthreadTest, testLatch) {
     }
 
     std::atomic<int> running = 1;
-    async<Launch::Schedule>(
-        [&running, ex, fs = std::move(fs), latchPtr = &latch]() mutable {
-            for (size_t i = 0; i < kMaxTask; ++i) {
-                async<Launch::Schedule>(std::move(fs[i]), ex);
-            }
-            latchPtr->await(ex);
-            EXPECT_EQ(0u, latchPtr->currentCount());
-            running--;
-        },
-        ex);
+    async(Launch::Schedule, Attribute{ex},
+          [ex, fs = std::move(fs), latchPtr = &latch]() mutable {
+              for (size_t i = 0; i < kMaxTask; ++i) {
+                  async(Launch::Schedule, Attribute{ex}, std::move(fs[i]));
+              }
+              latchPtr->await(ex);
+              EXPECT_EQ(0u, latchPtr->currentCount());
+          })
+        .thenValue([&running]() { running--; });
 
     while (running) {
     }
@@ -505,12 +509,13 @@ TEST_F(UthreadTest, testLatchThreadSafe) {
     executors::SimpleExecutor taskNotify(8);
 
     for (size_t i = 0; i < kMaxTask; ++i) {
-        async<Launch::Schedule>(
-            [&taskEx, &taskNotify, &runningTask]() mutable {
+        async(
+            Launch::Schedule, Attribute{&taskEx},
+            [&taskEx, &taskNotify]() mutable {
                 auto f = [&taskEx, &taskNotify]() mutable {
                     Latch latch(1u);
                     taskNotify.schedule([latchPtr = &latch]() mutable {
-                        usleep(1);
+                        std::this_thread::sleep_for(1us);
                         latchPtr->downCount();
                     });
                     latch.await(&taskEx);
@@ -526,14 +531,29 @@ TEST_F(UthreadTest, testLatchThreadSafe) {
                 fvec2.emplace_back(f);
                 collectAll<Launch::Current>(fvec2.begin(), fvec2.end(),
                                             &taskEx);
-
-                runningTask.fetch_sub(1u);
-            },
-            &taskEx);
-        usleep(10);
+            })
+            .thenValue([&runningTask]() { runningTask.fetch_sub(1u); });
+        std::this_thread::sleep_for(10us);
     }
 
     while (runningTask) {
+    }
+}
+
+TEST_F(UthreadTest, testAsync_v2) {
+    std::atomic<int> running = 1;
+    async(
+        Launch::Schedule, Attribute{.ex = &_executor, .stack_size = 128 * 1024},
+        [](int a, int b) { return a + b; }, 1, 2)
+        .thenValue([&running](int ans) {
+            EXPECT_EQ(ans, 3);
+            running--;
+        });
+    EXPECT_EQ(await(async(
+                  Launch::Current, Attribute{&_executor},
+                  [](int a, int b) { return a * b; }, 2, 512)),
+              1024);
+    while (running) {
     }
 }
 

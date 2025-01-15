@@ -17,15 +17,17 @@
 #ifndef ASYNC_SIMPLE_MOVEWRAPPER_H
 #define ASYNC_SIMPLE_MOVEWRAPPER_H
 
-#include <async_simple/Common.h>
-#include <exception>
+#ifndef ASYNC_SIMPLE_USE_MODULES
+#include <utility>
+
+#endif  // ASYNC_SIMPLE_USE_MODULES
 
 namespace async_simple {
 
 // std::function requre copyConstructable, hence we provide MoveWrapper perform
 // copy as move.
 template <typename T>
-class MoveWrapper {
+class [[deprecated]] MoveWrapper {
 public:
     MoveWrapper() = default;
     MoveWrapper(T&& value) : _value(std::move(value)) {}
@@ -47,4 +49,4 @@ private:
 
 }  // namespace async_simple
 
-#endif  // ASYNC_SIMPLE_VALUE_H
+#endif  // ASYNC_SIMPLE_MOVEWRAPPER_H

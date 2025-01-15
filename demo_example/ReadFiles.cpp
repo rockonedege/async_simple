@@ -20,7 +20,9 @@
 #include <string>
 #include <vector>
 #include "async_simple/Future.h"
+#include "async_simple/Promise.h"
 #include "async_simple/coro/Lazy.h"
+#include "async_simple/coro/SyncAwait.h"
 #include "async_simple/executors/SimpleExecutor.h"
 
 using namespace async_simple;
@@ -54,16 +56,6 @@ uint64_t CountCharInFiles(const std::vector<FileName> &Files, char c) {
 /////////// Asynchronous Part ///////////
 /////////////////////////////////////////
 
-// It's possible that user's toolchain is not sufficient to support ranges yet.
-template <typename Iterator>
-struct SubRange {
-    Iterator B, E;
-    SubRange(Iterator begin, Iterator end) : B(begin), E(end) {}
-
-    Iterator begin() { return B; }
-    Iterator end() { return E; }
-};
-
 template <class T>
 concept Range = requires(T &t) {
                     t.begin();
@@ -71,28 +63,26 @@ concept Range = requires(T &t) {
                 };
 
 // It is not travial to implement an asynchronous do_for_each.
-template <Range RangeTy, typename Callable>
-Future<Unit> do_for_each(RangeTy &&Range, Callable &&func) {
-    auto Begin = Range.begin();
-    auto End = Range.end();
-
-    if (Begin == End)
-        return makeReadyFuture(Unit());
-
-    while (true) {
-        auto F = std::invoke(func, *(Begin++));
+template <typename InputIt, typename Callable>
+Future<void> do_for_each(InputIt Begin, InputIt End, Callable func) {
+    for (auto It = Begin; It != End; ++It) {
+        auto F = std::invoke(func, *It);
         // If we met an error, return early.
-        if (F.result().hasError() || Begin == End)
+        if (F.result().hasError())
             return F;
-
-        if (!F.hasResult())
-            return std::move(F).thenTry(
-                [func = std::forward<Callable>(func), Begin = std::move(Begin),
-                 End = std::move(End)](auto &&) mutable {
-                    return do_for_each(SubRange(Begin, End),
-                                       std::forward<Callable>(func));
-                });
+        if (F.hasResult())
+            continue;
+        return std::move(F).thenTry(
+            [SubBegin = ++It, SubEnd = End, func](auto &&) {
+                return do_for_each(SubBegin, SubEnd, func);
+            });
     }
+    return makeReadyFuture();
+}
+
+template <Range RangeTy, typename Callable>
+Future<void> do_for_each(const RangeTy &Rng, Callable func) {
+    return do_for_each(Rng.begin(), Rng.end(), func);
 }
 
 // The *Impl is not the key point for this example, code readers
@@ -117,7 +107,7 @@ Future<uint64_t> CountCharInFilesAsync(const std::vector<FileName> &Files,
                            return CountCharInFileAsyncImpl(File, c).thenValue(
                                [ReadSize](auto &&Size) {
                                    *ReadSize += Size;
-                                   return makeReadyFuture(Unit());
+                                   return makeReadyFuture();
                                });
                        })
         .thenTry([ReadSize](auto &&) {
@@ -127,7 +117,7 @@ Future<uint64_t> CountCharInFilesAsync(const std::vector<FileName> &Files,
 }
 
 /////////////////////////////////////////
-/////////// Corotuine Part //////////////
+/////////// Coroutine Part //////////////
 /////////////////////////////////////////
 
 // The *Impl is not the key point for this example, code readers
@@ -177,8 +167,7 @@ int main() {
     f.wait();
 
     std::cout << "Calculating char counts asynchronously by coroutine.\n";
-    auto Task = CountCharInFilesCoro(Files, 'x').via(&executor);
-    auto ResCoro = syncAwait(std::move(Task));
+    auto ResCoro = syncAwait(CountCharInFilesCoro(Files, 'x'), &executor);
     std::cout << "Files contain " << ResCoro << " 'x' chars.\n";
 
     return 0;

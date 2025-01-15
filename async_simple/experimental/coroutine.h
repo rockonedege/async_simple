@@ -45,6 +45,7 @@ template <class P> struct hash<coroutine_handle<P>>;
 
  */
 
+#ifndef ASYNC_SIMPLE_USE_MODULES
 #if __has_include(<version>)
 // Use <version> to detect standard library. In case libstdc++ doesn't implement
 // <version>, it shouldn't own <coroutine> too.
@@ -54,17 +55,19 @@ template <class P> struct hash<coroutine_handle<P>>;
 // clang couldn't compile <coroutine> in libstdc++. In this case,
 // we could only use self-provided coroutine header.
 // Note: the <coroutine> header in libc++ is available for both clang and gcc.
-// And the outdated <experimental/coroutine> is available for clang only.
-#if (__cplusplus <= 201703L) || (defined(__clang__) && defined(__GLIBCXX__))
+// And the outdated <experimental/coroutine> is available for clang only(need to
+// exclude msvc).
+#if (__cplusplus <= 201703L && !defined(_MSC_VER)) || \
+    (defined(__clang__) && defined(__GLIBCXX__) && \
+     (__GLIBCXX__ < 20210408))
 #define USE_SELF_DEFINED_COROUTINE
 #endif
 
 #if __has_include(<coroutine>) && !defined(USE_SELF_DEFINED_COROUTINE)
 #include <coroutine>
-#define STD_CORO std
+#define HAS_NON_EXPERIMENTAL_COROUTINE
 #elif __has_include(<experimental/coroutine>)
 #include <experimental/coroutine>
-#define STD_CORO std::experimental
 #else
 
 #if defined(__cpp_lib_three_way_comparison) && \
@@ -328,7 +331,7 @@ private:
 
     void* __handle_ = nullptr;
 
-#elif defined(_LIBCPP_COMPILER_GCC)
+#elif defined(__GNUC__) and !defined(__clang__)
     // GCC doesn't implement __builtin_coro_noop().
     // Construct the coroutine frame manually instead.
     struct __noop_coroutine_frame_ty_ {
@@ -350,7 +353,7 @@ private:
 
 using noop_coroutine_handle = coroutine_handle<noop_coroutine_promise>;
 
-#if defined(_LIBCPP_COMPILER_GCC)
+#if defined(__GNUC__) and !defined(__clang__)
 inline noop_coroutine_handle::__noop_coroutine_frame_ty_
     noop_coroutine_handle::__noop_coroutine_frame_{};
 #endif
@@ -385,15 +388,28 @@ struct hash<STD_CORO::coroutine_handle<_Tp> > {
         return hash<void*>()(__v.address());
     }
 };
+}  // namespace std
+#undef STD_CORO
+#endif
 
+#if !defined(HAS_NON_EXPERIMENTAL_COROUTINE)
+
+namespace std {
+using std::experimental::coroutine_handle;
+using std::experimental::coroutine_traits;
+using std::experimental::noop_coroutine;
+using std::experimental::noop_coroutine_handle;
+using std::experimental::suspend_always;
+using std::experimental::suspend_never;
 }  // namespace std
 
-#endif
+#endif /* HAS_NON_EXPERIMENTAL_COROUTINE */
+#endif  // ASYNC_SIMPLE_USE_MODULES
 
 namespace async_simple {
 namespace coro {
 template <typename T = void>
-using CoroHandle = STD_CORO::coroutine_handle<T>;
+using CoroHandle = std::coroutine_handle<T>;
 }
 }  // namespace async_simple
 

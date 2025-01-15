@@ -6,7 +6,7 @@ Lazy is implemented by C++20 stackless coroutine. A Lazy is a lazy-evaluated com
 
 We need to include `<async_simple/coro/Lazy.h>` first to use Lazy. And we need to implement a function whose return type is `Lazy<T>`. Like:
 
-```C++
+```cpp
 #include <async_simple/coro/Lazy.h>
 Lazy<int> task1(int x) {
     co_return x; // A function with co_return is a coroutine function.
@@ -15,7 +15,7 @@ Lazy<int> task1(int x) {
 
 We could `co_await` other `awaitable` objects in Lazy:
 
-```C++
+```cpp
 #include <async_simple/coro/Lazy.h>
 Lazy<int> task2(int x) {
     co_await std::suspend_always{};
@@ -23,15 +23,20 @@ Lazy<int> task2(int x) {
 }
 ```
 
+## Alignment Requirement
+
+Due the limitation of ABI, Compiler Implementation and the usage
+of async_simple itself, we requrie the alignment of `T` in `Lazy<T>` can exceed `alignof(std::max_align_t)` (which is generally 16).
+
 ## Start Lazy
 
-We could start a Lazy by `co_await`, `syncAwait` and `.start(callback)`.
+We could start a Lazy by `co_await`, `syncAwait`, `.start(callback)` or `directlyStart(callback, executor)`.
 
 ### co_await
 
 For example:
 
-```C++
+```cpp
 #include <async_simple/coro/Lazy.h>
 Lazy<int> task1(int x) {
     co_return x;
@@ -52,12 +57,12 @@ Note that, we couldn't assume that the statements after a `co_await expression` 
 - There is an bug in the scheduler. The task submitted to the scheduler wouldn't be promised to schedule.
 - There is an exception happened in the waited task. In this case, the current coroutine would return to its caller instead of executing the following statments.
 
-Another thing we need to note is that the function contains a `co_await` would be a C++20 stackless coroutine too.
+Note that we should only `co_await` a Lazy in a Lazy function in users code.
 
 ### .start(callback)
 
 For example:
-```C++
+```cpp
 #include <async_simple/coro/Lazy.h>
 #include <iostream>
 Lazy<int> task1(int x) {
@@ -84,15 +89,37 @@ The `callback` in `Lazy<T>::start(callback)` need to be a [callable](https://en.
 By design, `start` should be a non-blocking asynchronous interface. Semantically, user could image `start` would return immediately. User shouldn't assume when `start` would return. It depends on how the Lazy would execute actually.
 
 In case the `callback` isn't needed, we could write:
-```C++
+```cpp
 task().start([](auto&&){});
+```
+
+
+### directlyStart(callback, executor)
+
+Similar to `start`, but provides a paramter for binding a scheduler when starting a coroutine. It is important to note that `directlyStart` does not immediately schedule the task when coroutine start.
+
+```cpp
+Lazy<> task() {
+    auto e = co_await currentExecutor{};
+    // binding executor successfully.
+    assert(e!=nullptr);
+    // lazy schedule, work doesn't run in executor.
+    assert(e->currentThreadInExecutor()==false);
+    co_await coro::Sleep(1s);
+    // Sleep function need executor schedule, now work runs in executor.
+    assert(e->currentThreadInExecutor()==true);
+}
+void func() {
+    auto executor=std::make_shared<executors::SimpleExecutor>(1);
+    task().directlyStart([executor](Try<void> Result){},executor.get());
+}
 ```
 
 ### syncAwait
 
 For example:
 
-```C++
+```cpp
 #include <async_simple/coro/Lazy.h>
 Lazy<int> task1(int x) {
     co_return x;
@@ -115,7 +142,7 @@ For the object `task` whose type is `Lazy<T>`, the type of `co_await task` would
 
 For example:
 
-```C++
+```cpp
 Lazy<int> foo() {
     throw std::runtime_error("test");
     co_return 1;
@@ -137,11 +164,11 @@ void baz() {
 }
 ```
 
-Note that it is not a good practice to wrap `co_await` by `try...catch` statement all the time. One the one hand, it is inconvenient. On the other hand, the current coroutine would handle the unhandled_exception by the design of coroutine. For the example of `Lazy`, in case of an unhandled exception happens, the exception would be stored into the current Lazy.
+Note that it is not a good practice to wrap `co_await` by `try...catch` statement all the time. On the one hand, it is inconvenient. On the other hand, the current coroutine would handle the unhandled_exception by the design of coroutine. For the example of `Lazy`, in case of an unhandled exception happens, the exception would be stored into the current Lazy.
 
 For example:
 
-```C++
+```cpp
 Lazy<int> foo() {
     throw std::runtime_error("test");
     co_return 1;
@@ -175,7 +202,7 @@ If there is an exception happened in the chain of Lazies, the exception would be
 
 If we want to handle the exception in place when we awaits exception, we could use `coAwaitTry` method. For example:
 
-```C++
+```cpp
 Lazy<int> foo() {
     throw std::runtime_error("test");
     co_return 1;
@@ -194,13 +221,13 @@ For an object `task` with type `Lazy<T>`, the type of expression `co_await task.
 
 # RescheduleLazy
 
-Semantically, RescheduleLazy is a Lazy with an executor. Unlike Lazy, `co_await` a RescheduleLazy wouldn't invoke symmetric transformation. It would submit the task to resume the RescheduleLazy to the corresponding executor. Since RescheduleLazy is a Lazy semantically. So RescheduleLazy would be able to use the methods as Lazy does: `co_await`, `.start` and `.syncAwait`.
+Semantically, RescheduleLazy is a Lazy with an executor. `RescheduleLazy` only supports `.start` and `syncAwait` to start. It would submit the task to resume the RescheduleLazy to the corresponding executor.
 
 ## Get RescheduleLazy
 
 We couldn't create RescheduleLazy directly. And RescheduleLazy couldn't be the return type of a coroutine. We could only get the RescheduleLazy by the `via` method of `Lazy`. For example:
 
-```C++
+```cpp
 void foo() {
     executors::SimpleExecutor e1(1);
     auto addOne = [&](int x) -> Lazy<int> {
@@ -218,7 +245,7 @@ We could use Lazy only to write a seris of computation tasks. And we could assig
 
 For example:
 
-```C++
+```cpp
 #include <async_simple/coro/Lazy.h>
 #include <iostream>
 Lazy<int> task1(int x) {
@@ -245,13 +272,87 @@ In the above example, `task1...task4` represents a task chain consists of Lazy. 
 
 So we could assign the executor at the root the task chain simply.
 
+# LazyLocals
+
+LazyLocals is similar to `thread_local` in a thread environment. Users can customize their own LazyLocals by deriving from LazyLocals and implement static function `T::classsof(const LazyLocalBase*)` 
+
+`async_simple` provides a type conversion check for LazyLocals that is safe and efficient without relying on RTTI, requiring only a single integer comparison operation. Additionally, `async_simple` automatically manages the lifecycle of LazyLocal. Below is an example of usage:
+
+```cpp
+template<typename T>
+struct mylocal: public LazyLocalBase {
+    template<typename... Args>
+    mylocalImpl(Args...&& args): LazyLocalBase(&tag), value(std::forward<Args>(args)...){}
+    static bool classof(const LazyLocalBase* base) {
+        return base->getTypeTag() == &tag;
+    }
+    T value;
+    inline static char tag;
+};
+
+void foo() {
+    auto sub_task = []() -> Lazy<> {
+        // Get the pointer to the lazy local value by calling co_await CurrentLazyLocals
+        mylocal<int>* v = co_await CurrentLazyLocals<mylocal<int>>{};
+        // If the coroutine is not bound to a local variable, or the type conversion fails, return a null pointer
+        EXPECT_NE(v, nullptr);
+        EXPECT_EQ(v->value, 42);
+    };
+
+    auto task = []() -> Lazy<> {
+        // Obtain the base class pointer
+        LazyLocalBase* v = co_await CurrentLazyLocals{};
+        // If the coroutine is not bound to a local variable, return a null pointer
+        EXPECT_NE(v, nullptr);
+        // The user can skip the safety check of type conversion by casting the base class pointer
+        EXPECT_EQ(static_cast<mylocal<int>>(v)->value, 42);
+        // The local value will automatically propagate to each coroutine in the call chain via co_await
+        co_await sub_task();
+        co_return;
+    };
+    syncAwait(task().setLazyLocal<mylocal<int>>(42));
+}
+```
+
+`setLazyLocal` allows users to construct the specified object in place or pass in a `unique_ptr` or `shared_ptr` of that object.
+
+It is important to note that LazyLocals will be destructed after the coroutine completes and before the callback is invoked. Therefore, if you want to safely access LazyLocals in the callback function, you need to manage the lifecycle yourself or share the lifecycle using `shared_ptr`.
+
+```c++
+void foo() {
+    int* i = new int(42);
+    task().via(&ex).setLazyLocal<mylocal<int*>>(i).start([i](Try<void>) {
+        std::cout << *i << std::endl;
+        delete i;
+    });
+}
+
+void bar() {
+    auto ptr = std::make_shared<mylocal<int>>(42);
+    task().via(&ex).setLazyLocal<mylocal<int*>>(ptr).start([ptr](Try<void>) {
+        std::cout << ptr->value << std::endl;
+    });
+}
+```
+
+Finally, calling `setLazyLocal` again in a coroutine that has already called `setLazyLocal` will throw a `std::logic_error` exception, as we want to ensure that the bound LazyLocals are not changed midway through the coroutine's execution.
+
+# Yield
+
+Sometimes we may want the executing Lazy to yield out. (For example, we found the Lazy has been executed for a long time)
+We can yield it by `co_await async_simple::coro::Yield{};` in the Lazy.
+
+# Get the Current Executor
+
+We can get the current executor in a Lazy by `co_await async_simple::CurrentExecutor{};`
+
 # Collect
 
 ## CollectAll
 
 It is a common need to wait for a lot of tasks. We could use `collectAll` to do this. For example:
 
-```C++
+```cpp
 Lazy<int> foo() {
     std::vector<Lazy<int>> input;
     input.push_back(ComputingTask(1));
@@ -273,7 +374,7 @@ Lazy<int> foo() {
 
 The example for the second type:
 
-```C++
+```cpp
 Lazy<int> computeInt();
 Lazy<double> computeDouble();
 Lazy<std::string> computeString();
@@ -303,7 +404,7 @@ Here let's talk more about `collectAllPara`. Note that the current coroutine nee
 
 For example:
 
-```C++
+```cpp
 Lazy<int> foo() {
     std::vector<Lazy<int>> input;
     input.push_back(ComputingTask(1));
@@ -331,7 +432,7 @@ When we need to execute concurrent tasks in batches. We could use `collectAllWin
 
 For example:
 
-```C++
+```cpp
 Lazy<int> sum(std::vector<Try<int>> input);
 Lazy<int> batch_sum(size_t total_number, size_t batch_size)  {
     std::vector<Lazy<int>> input;
@@ -346,34 +447,163 @@ Lazy<int> batch_sum(size_t total_number, size_t batch_size)  {
 
 ### collectAny
 
-Sometimes we need only a result of a lot of tasks. We could use `collectAny` in this case. `collectAny` would return the result of the first task get completed. All other tasks would detached and their results would be ignored.
+Sometimes we need only a result of a lot of tasks. We could use `collectAny` in this case. `collectAny` would return the result of the first task get completed. All other tasks would detach and their results would be ignored.
 
-The argument of `collectAny` is `std::vector<Lazy<T>>`. The return type is `Lazy<CollectAnyResult<T>>`.
+#### Parameter Type and the corresponding behavior
+
+- Argument type: `std::vector<LazyType<T>>`. Return type:  `Lazy<CollectAnyResult<T>>`.
+- Argument type: `LazyType<T1>, LazyType<T2>, LazyType<T3>, ...`. Return type: `std::variant<Try<T1>, Try<T2>, Try<T3>, ...>`.
+- Argument type: `std::pair/std::tuple<LazyType<T1>, [](size_t, Try<T1>)>, std::pair/std::tuple<LazyType<T2>, [](size_t, Try<T2>)>, ...`. Return type: `size_t`.
+- Argument type: `std::vector<LazyType<T>>, [](Try<T>)`. Return type: `size_t`
+
+LazyType should be `Lazy<T>` or `RescheduleLazy<T>`.
+
+If LazyType is `Lazy<T>`, `collectAny` will execute the corresponding task in the current thread immediately until the coroutine task get suspended. If LazyType is `RescheduleLazy<T>`,
+`collectAny` will submit the task to the specified Executor. Then `collectAny` will iterate on the next task. 
+
+It depends on the use case and the implementation of Executor to choose `Lazy<T>` or `RescheduleLazy<T>`. If it takes a little time to reach the first possible suspend point, it may be better to use `Lazy<T>`. For example,
+
+```cpp
+bool should_get_value();
+int default_value();
+Lazy<int> conditionalWait() {
+    if (should_get_value())
+        co_return co_await get_remote_value();
+    co_return default_value();
+}
+Lazy<int> getAnyConditionalValue() {
+    std::vector<Lazy<int>> input;
+    for (unsigned i = 0; i < 1000; i++)
+        input.push_back(conditionalWait());
+
+    auto any_result = co_await collectAny(std::move(input));
+    assert(!any_result.hasError());
+    co_return any_result.value();
+}
+```
+
+In this example, it takes a short time to reach the first suspend point. And it is possible we can short-cut it. It is possible that the 1st task returns its result on the first iteration and we don't need to evaluate all the other tasks.
+
+But if it takes a long time to reash the first suspend point, maybe it is better to use `RescheduleLazy<T>`.
+
+
+```cpp
+void prepare_for_long_time();
+Lazy<int> another_long_computing();
+Lazy<int> long_computing() {
+    prepare_for_long_time();
+    co_return co_await another_long_computing();
+}
+Lazy<int> getAnyConditionalValue(Executor* e) {
+    std::vector<RescheduleLazy<int>> input;
+    for (unsigned i = 0; i < 1000; i++)
+        input.push_back(conditionalWait().via(e));
+
+    auto any_result = co_await collectAny(std::move(input));
+    assert(!any_result.hasError());
+    co_return any_result.value();
+}
+```
+
+In this case, every task is heavier. And if we use `Lazy<T>`, it is possible that one of the task takes the resources for a long time and other tasks can't get started. So it may be better to use `RescheduleLazy<T>` in such cases.
+
+When pass callback function to collectAny, the result of executed coroutine will be handled in callback function, and return the index of the executed coroutine.
+
+```cpp
+void variadicCallback() {
+    auto test0 = []() -> Lazy<Unit> { co_return Unit{}; };
+    auto test1 = []() -> Lazy<int> { co_return 42; };
+    auto test2 = [](int val) -> Lazy<std::string> {
+        co_return std::to_string(val);
+    };
+
+    auto collectAnyLazy = [](auto&&... args) -> Lazy<size_t> {
+        co_return co_await collectAny(std::move(args)...);
+    };
+    
+    int call_count = 0;
+    size_t index = syncAwait(
+        collectAnyLazy(std::pair{test0(), [&](auto) { call_count++; }},
+                       std::pair{test1(),
+                                 [&](Try<int> val) {
+                                     call_count++;
+                                     EXPECT_EQ(val.value(), 42);
+                                 }},
+                       std::pair{test2(42), [&](Try<std::string> val) {
+                                     call_count++;
+                                     EXPECT_EQ("42", val.value());
+                                 }}));
+    EXPECT_EQ(1, call_count);
+}
+
+void vectorCallback() {
+    auto test0 = []() -> Lazy<int> { co_return 41; };
+    auto test1 = []() -> Lazy<int> { co_return 42; };
+
+    std::vector<Lazy<int>> input;
+    input.push_back(test0());
+    input.push_back(test1());
+
+    auto collectAnyLazy = [](auto input, auto func) -> Lazy<void> {
+        co_await collectAny(std::move(input), func);
+    };
+
+    size_t index = syncAwait(collectAnyLazy(std::move(input), [](size_t index, Try<int> val) {
+        if (index == 0) {
+            EXPECT_EQ(val.value(), 41);
+        } else {
+            EXPECT_EQ(val.value(), 42);
+        }
+    }));
+}
+```
+
+#### CollectAnyResult
 
 The structure of `CollectAnyResult` would be:
-```C++
+```cpp
 template <typename T>
 struct CollectAnyResult<void> {
     size_t _idx;
     Try<T> _value;
+
+    size_t index() const;
+    bool hasError() const;
+    // Require hasError() == true. Otherwise it is UB to call
+    // this method.
+    std::exception_ptr getException() const;
+    // Require hasError() == false. Otherwise it is UB to call
+    // value() method.
+    const T& value() const&;
+    T& value() &;
+    T&& value() &&;
+    const T&& value() const&&;
 };
 ```
 
-`_idx` means the index of the first completed task. `_value` represents the corresponding value.
+`_idx` means the index of the first completed task, we can use `index()` method to get the index.. `_value` represents the corresponding value. We can use `hasError()` method to check if the result failed. If the result failed, we can use `getException()` method to get the exception pointer. If the result succeeded, we can use `value()` method to get the value.
 
 For exmaple:
 
-```C++
+```cpp
 Lazy<void> foo() {
     std::vector<Lazy<int>> input;
     input.push_back(ComputingTask(1));
     input.push_back(ComputingTask(2));
 
     auto any_result = co_await collectAny(std::move(input));
-    std::cout << "The index of the first task completed is " << any_result._idx << "\n";
-    if (any_result._value.hasError())
+    std::cout << "The index of the first task completed is " << any_result.index() << "\n";
+    if (any_result.hasError())
         std::cout << "It failed.\n";
     else
-        std::cout << "Its result: " << any_result._value.value() << "\n";
+        std::cout << "Its result: " << any_result.value() << "\n";
+}
+Lazy<void> foo_var() {
+  auto res = co_await collectAny(ComputingTask<int>(1),ComputingTask<int>(2),ComputingTask<double>(3.14f));
+  std::cout<< "Index: " << res.index();
+  std::visit([](auto &&value){
+    std::cout<<"Value: "<< value <<std::endl;
+  }, res);
 }
 ```
+

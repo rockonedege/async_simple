@@ -23,18 +23,20 @@
 #ifndef ASYNC_SIMPLE_UTHREAD_INTERNAL_THREAD_H
 #define ASYNC_SIMPLE_UTHREAD_INTERNAL_THREAD_H
 
-#include <ucontext.h>
+#ifndef ASYNC_SIMPLE_USE_MODULES
 #include <memory>
-#include <type_traits>
 
-#include <async_simple/Future.h>
-#include <async_simple/uthread/internal/thread_impl.h>
+#include "async_simple/Future.h"
+#include "async_simple/Promise.h"
+#include "async_simple/uthread/internal/thread_impl.h"
+
+#endif  // ASYNC_SIMPLE_USE_MODULES
 
 namespace async_simple {
 namespace uthread {
 namespace internal {
 
-static constexpr size_t default_base_stack_size = 512 * 1024;
+inline constexpr size_t default_base_stack_size = 512 * 1024;
 size_t get_base_stack_size();
 
 class thread_context {
@@ -59,7 +61,7 @@ private:
     stack_holder make_stack();
 
 public:
-    explicit thread_context(std::function<void()> func);
+    explicit thread_context(std::function<void()> func, size_t stack_size = 0);
     ~thread_context();
     void switch_in();
     void switch_out();

@@ -1,29 +1,28 @@
-if("${GOOGLETEST_ROOT}" STREQUAL "")
-    set(GOOGLETEST_ROOT "/usr/local")
+if (DEFINED GMOCK_INCLUDE_DIR AND DEFINED GTEST_INCLUDE_DIR
+    AND DEFINED GTEST_LIBRARIES AND DEFINED GMOCK_LIBRARIES)
+    message(STATUS "Using GTest from specified path")
+else()
+    message(STATUS "Not all GTest variable got specified: "
+                   "'GMOCK_INCLUDE_DIR', 'GTEST_INCLUDE_DIR', "
+                   "'GTEST_LIBRARIES', 'GMOCK_LIBRARIES'")
+    message(STATUS "fetch GTest from https://github.com/google/googletest.git")
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG release-1.11.0
+        GIT_SHALLOW ON
+    )
+    
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    set(BUILD_GMOCK ON CACHE BOOL "" FORCE)
+    set(BUILD_GTEST ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+    set(GMOCK_INCLUDE_DIR ${CMAKE_BINARY_DIR}/_deps/googletest-src/googlemock/include/)
+    set(GTEST_INCLUDE_DIR ${CMAKE_BINARY_DIR}/_deps/googletest-src/googletest/include/)
+    set(GTEST_LIBRARIES gtest_main)
+    set(GMOCK_LIBRARIES gmock_main)
 endif()
 
-find_path(GTEST_INCLUDE_DIR
-    NAMES gtest/gtest.h
-    PATHS ${GOOGLETEST_ROOT}/include)
-
-find_library(GTEST_LIBRARIES
-    NAME gtest
-    PATHS ${GOOGLETEST_ROOT}/lib)
-
-if (NOT TARGET gtest)
-    add_library(gtest STATIC IMPORTED)
-    set_target_properties(gtest
-        PROPERTIES INTERFACE_COMPILE_DEFINITIONS
-        HAS_GTEST
-        INTERFACE_INCLUDE_DIRECTORIES
-        "${GTEST_INCLUDE_DIR}"
-        IMPORTED_LOCATION
-        "${GTEST_LIBRARIES}")
-endif()
-
-include(FindPackageHandleStandardArgs)
-find_package_handle_standard_args(gtest DEFAULT_MSG GTEST_LIBRARIES GTEST_INCLUDE_DIR)
-
-MARK_AS_ADVANCED(
-    GTEST_INCLUDE_DIR
-    GTEST_LIBRARIES)
+message(STATUS "GTest: ${GTEST_INCLUDE_DIR}, ${GTEST_LIBRARIES}")
+message(STATUS "GMock: ${GMOCK_INCLUDE_DIR}, ${GMOCK_LIBRARIES}")

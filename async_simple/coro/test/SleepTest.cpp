@@ -13,17 +13,25 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <async_simple/coro/Lazy.h>
-#include <async_simple/coro/Sleep.h>
-#include <async_simple/executors/SimpleExecutor.h>
-#include <async_simple/test/unittest.h>
-#include <exception>
+
+#include <gtest/gtest.h>
+#include <cstdint>
 #include <functional>
-#include <type_traits>
+
+#include "async_simple/Executor.h"
+#include "async_simple/Signal.h"
+#include "async_simple/coro/Collect.h"
+#include "async_simple/coro/Lazy.h"
+#include "async_simple/coro/Sleep.h"
+#include "async_simple/coro/SyncAwait.h"
+#include "async_simple/executors/SimpleExecutor.h"
+#include "async_simple/test/unittest.h"
 
 #include <chrono>
+#include <future>
 #include <iostream>
 #include <thread>
+#include <vector>
 
 using namespace std;
 using namespace std::chrono_literals;
@@ -78,6 +86,96 @@ TEST_F(SleepTest, testSleep) {
     };
 
     syncAwait(sleepTask2().via(&e1));
+
+    auto sleepTask3 = [&]() -> Lazy<> {
+        class Executor : public async_simple::Executor {
+        public:
+            Executor() = default;
+            virtual bool schedule(Func) override { return true; }
+            virtual void schedule(Func func, Duration dur) override {
+                std::thread([this, func = std::move(func), dur]() {
+                    id = std::this_thread::get_id();
+                    std::this_thread::sleep_for(dur);
+                    func();
+                }).detach();
+            }
+            virtual void schedule(Func func, Duration dur, uint64_t,
+                                  Slot*) override {
+                schedule(std::move(func), dur);
+            }
+
+            std::thread::id id;
+        };
+        Executor ex;
+        auto startTime = std::chrono::system_clock::now();
+        co_await coro::sleep(&ex, 900ms);
+        auto endTime = std::chrono::system_clock::now();
+
+        std::cout << std::this_thread::get_id() << std::endl;
+        std::cout << ex.id << std::endl;
+
+        EXPECT_EQ(std::this_thread::get_id(), ex.id);
+
+        auto duration = endTime - startTime;
+        cout << std::chrono::duration_cast<std::chrono::milliseconds>(duration)
+                    .count()
+             << endl;
+    };
+
+    syncAwait(sleepTask3().via(&e1));
+}
+
+Lazy<void> cancelSleep() {
+    auto executor = co_await CurrentExecutor{};
+    auto sleep = [](int i, std::atomic<int>& cnt) -> Lazy<void> {
+        bool cancel_flag = false;
+        try {
+            co_await async_simple::coro::sleep(i * 1s);
+        } catch (const async_simple::SignalException& err) {
+            ++cnt;
+            cancel_flag = true;
+            EXPECT_TRUE(err.value() == async_simple::Terminate);
+        }
+        auto slot = co_await async_simple::coro::CurrentSlot{};
+        auto ok = slot->signal()->emit(SignalType::Terminate);
+        if (ok) {
+            std::cout << "Coro " << i << " emit cancel work" << std::endl;
+        } else {
+            EXPECT_TRUE(cancel_flag);
+        }
+        co_return;
+    };
+    {
+        std::vector<RescheduleLazy<void>> works;
+        std::atomic<int> cnt;
+        auto tp1 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 100; ++i) {
+            works.emplace_back(sleep(i, cnt).via(executor));
+        }
+        co_await async_simple::coro::collectAll(std::move(works));
+        auto tp2 = std::chrono::steady_clock::now();
+        EXPECT_EQ(cnt, 99);
+        std::cout << "cost time: " << (tp2 - tp1) / 1ms << "ms" << std::endl;
+        EXPECT_LE((tp2 - tp1) / 1ms, 800);
+    }
+    {
+        std::vector<RescheduleLazy<void>> works;
+        std::atomic<int> cnt;
+        auto tp1 = std::chrono::steady_clock::now();
+        for (int i = 99; i >= 0; --i) {
+            works.emplace_back(sleep(i, cnt).via(executor));
+        }
+        co_await async_simple::coro::collectAll(std::move(works));
+        auto tp2 = std::chrono::steady_clock::now();
+        EXPECT_EQ(cnt, 99);
+        std::cout << "cost time: " << (tp2 - tp1) / 1ms << "ms" << std::endl;
+        EXPECT_LE((tp2 - tp1) / 1ms, 800);
+    }
+}
+
+TEST_F(SleepTest, testCancelSleep) {
+    executors::SimpleExecutor e1(5);
+    syncAwait(cancelSleep().via(&e1));
 }
 
 }  // namespace coro

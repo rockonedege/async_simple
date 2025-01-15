@@ -13,15 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <async_simple/coro/Lazy.h>
-#include <async_simple/executors/SimpleExecutor.h>
-#include <async_simple/test/unittest.h>
-#include <exception>
-#include <functional>
-#include <type_traits>
 
-#include <iostream>
-#include <thread>
+#include "async_simple/coro/Lazy.h"
+#include "async_simple/coro/SyncAwait.h"
+#include "async_simple/executors/SimpleExecutor.h"
+#include "async_simple/test/unittest.h"
 
 using namespace std;
 
@@ -56,7 +52,7 @@ public:
 class Awaiter {
 public:
     bool await_ready() noexcept { return false; }
-    bool await_suspend(STD_CORO::coroutine_handle<> continuation) noexcept {
+    bool await_suspend(std::coroutine_handle<> continuation) noexcept {
         return false;
     }
     void await_resume() noexcept {}

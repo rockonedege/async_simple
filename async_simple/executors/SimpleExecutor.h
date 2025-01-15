@@ -16,18 +16,21 @@
 #ifndef FUTURE_SIMPLE_EXECUTOR_H
 #define FUTURE_SIMPLE_EXECUTOR_H
 
-#include <unistd.h>
+#ifndef ASYNC_SIMPLE_USE_MODULES
 #include <functional>
 
-#include <async_simple/Executor.h>
-#include <async_simple/executors/SimpleIOExecutor.h>
-#include <async_simple/util/ThreadPool.h>
+#include "async_simple/Executor.h"
+#include "async_simple/executors/SimpleIOExecutor.h"
+#include "async_simple/util/ThreadPool.h"
 
-#include <thread>
+#endif  // ASYNC_SIMPLE_USE_MODULES
 
 namespace async_simple {
 
 namespace executors {
+
+// 0xBFFFFFFF == ~0x40000000
+inline constexpr int64_t kContextMask = 0x40000000;
 
 // This is a simple executor. The intention of SimpleExecutor is to make the
 // test available and show how user should implement their executors. People who
@@ -43,15 +46,8 @@ public:
     using Func = Executor::Func;
     using Context = Executor::Context;
 
-    union ContextUnion {
-        Context ctx;
-        int64_t id;
-    };
-
 public:
-    SimpleExecutor(size_t threadNum) : _pool(threadNum) {
-        [[maybe_unused]] auto ret = _pool.start();
-        assert(ret);
+    explicit SimpleExecutor(size_t threadNum) : _pool(threadNum) {
         _ioExecutor.init();
     }
     ~SimpleExecutor() { _ioExecutor.destroy(); }
@@ -69,22 +65,19 @@ public:
     size_t currentContextId() const override { return _pool.getCurrentId(); }
 
     Context checkout() override {
-        ContextUnion u;
-        // avoid u.id equal to NULLCTX
-        u.id = _pool.getCurrentId() | 0x40000000;
-        return u.ctx;
+        // avoid CurrentId equal to NULLCTX
+        return reinterpret_cast<Context>(_pool.getCurrentId() | kContextMask);
     }
+
     bool checkin(Func func, Context ctx, ScheduleOptions opts) override {
-        ContextUnion u;
-        u.ctx = ctx;
-        // 0xBFFFFFFF == ~0x40000000
+        int64_t id = reinterpret_cast<int64_t>(ctx);
         auto prompt =
-            _pool.getCurrentId() == (u.id & 0xBFFFFFFF) && opts.prompt;
+            _pool.getCurrentId() == (id & (~kContextMask)) && opts.prompt;
         if (prompt) {
             func();
             return true;
         }
-        return _pool.scheduleById(std::move(func), u.id & 0xBFFFFFFF) ==
+        return _pool.scheduleById(std::move(func), id & (~kContextMask)) ==
                util::ThreadPool::ERROR_NONE;
     }
 

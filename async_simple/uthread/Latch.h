@@ -16,8 +16,13 @@
 #ifndef ASYNC_SIMPLE_UTHREAD_LATCH_H
 #define ASYNC_SIMPLE_UTHREAD_LATCH_H
 
-#include <async_simple/Future.h>
+#ifndef ASYNC_SIMPLE_USE_MODULES
 #include <type_traits>
+#include "async_simple/Future.h"
+#include "async_simple/Promise.h"
+#include "async_simple/uthread/Await.h"
+
+#endif  // ASYNC_SIMPLE_USE_MODULES
 
 namespace async_simple {
 namespace uthread {
@@ -60,7 +65,7 @@ public:
         if (_skip) {
             return;
         }
-        _promise.getFuture().via(ex).get();
+        uthread::await(_promise.getFuture().via(ex));
     }
     std::size_t currentCount() const {
         return _count.load(std::memory_order_acquire);

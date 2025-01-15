@@ -16,19 +16,18 @@
 #ifndef ASYNC_SIMPLE_FUTURESTATE_H
 #define ASYNC_SIMPLE_FUTURESTATE_H
 
+#ifndef ASYNC_SIMPLE_USE_MODULES
 #include <atomic>
-#include <iostream>
-
-#include <async_simple/Common.h>
-#include <async_simple/Executor.h>
-#include <async_simple/MoveWrapper.h>
-#include <async_simple/Try.h>
 #include <cassert>
-#include <condition_variable>
-#include <functional>
-#include <mutex>
+#include <iostream>
 #include <stdexcept>
-#include <thread>
+
+#include "async_simple/Common.h"
+#include "async_simple/Executor.h"
+#include "async_simple/Try.h"
+#include "async_simple/util/move_only_function.h"
+
+#endif  // ASYNC_SIMPLE_USE_MODULES
 
 namespace async_simple {
 
@@ -55,14 +54,14 @@ constexpr State operator&(State lhs, State rhs) {
 
 // FutureState is a shared state between Future and Promise.
 //
-// This is the key component for Future/Promsie. It guarantees
+// This is the key component for Future/Promise. It guarantees
 // the thread safety and call executor to schedule when necessary.
 //
 // Users should **never** use FutureState directly.
 template <typename T>
 class FutureState {
 private:
-    using Continuation = std::function<void(Try<T>&& value)>;
+    using Continuation = util::move_only_function<void(Try<T>&& value)>;
 
 private:
     // A helper to help FutureState to count the references to guarantee
@@ -140,22 +139,22 @@ public:
         return (state & allow) != detail::State();
     }
 
-    inline __attribute__((__always_inline__)) void attachOne() {
+    AS_INLINE void attachOne() {
         _attached.fetch_add(1, std::memory_order_relaxed);
     }
-    inline __attribute__((__always_inline__)) void detachOne() {
-        auto old = _attached.fetch_sub(1, std::memory_order_relaxed);
+    AS_INLINE void detachOne() {
+        auto old = _attached.fetch_sub(1, std::memory_order_acq_rel);
         assert(old >= 1u);
         if (old == 1) {
             delete this;
         }
     }
-    inline __attribute__((__always_inline__)) void attachPromise() {
+    AS_INLINE void attachPromise() {
         _promiseRef.fetch_add(1, std::memory_order_relaxed);
         attachOne();
     }
-    inline __attribute__((__always_inline__)) void detachPromise() {
-        auto old = _promiseRef.fetch_sub(1, std::memory_order_relaxed);
+    AS_INLINE void detachPromise() {
+        auto old = _promiseRef.fetch_sub(1, std::memory_order_acq_rel);
         assert(old >= 1u);
         if (!hasResult() && old == 1) {
             try {
@@ -168,8 +167,8 @@ public:
     }
 
 public:
-    Try<T>& getTry() noexcept { return _try; }
-    const Try<T>& getTry() const noexcept { return _try; }
+    Try<T>& getTry() noexcept { return _try_value; }
+    const Try<T>& getTry() const noexcept { return _try_value; }
 
     void setExecutor(Executor* ex) { _executor = ex; }
 
@@ -195,8 +194,12 @@ public:
     //  ONLY_RESULT: promise.setValue called
     //  ONLY_CONTINUATION: future.thenImpl called
     void setResult(Try<T>&& value) {
+#if !defined(__GNUC__) || __GNUC__ < 12
+        // GCC 12 issues a spurious uninitialized-var warning.
+        // See details: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109448
         logicAssert(!hasResult(), "FutureState already has a result");
-        _try = std::move(value);
+#endif
+        _try_value = std::move(value);
 
         auto state = _state.load(std::memory_order_acquire);
         switch (state) {
@@ -224,11 +227,10 @@ public:
     void setContinuation(F&& func) {
         logicAssert(!hasContinuation(),
                     "FutureState already has a continuation");
-        MoveWrapper<F> lambdaFunc(std::move(func));
-        new (&_continuation) Continuation([lambdaFunc](Try<T>&& v) mutable {
-            auto& lambda = lambdaFunc.get();
-            lambda(std::forward<Try<T>>(v));
-        });
+        new (&_continuation)
+            Continuation([func = std::move(func)](Try<T>&& v) mutable {
+                func(std::forward<Try<T>>(v));
+            });
 
         auto state = _state.load(std::memory_order_acquire);
         switch (state) {
@@ -238,7 +240,7 @@ public:
                         std::memory_order_release)) {
                     return;
                 }
-                // state has already transfered, fallthrough
+                // state has already transferred, fallthrough
                 assert(_state.load(std::memory_order_relaxed) ==
                        detail::State::ONLY_RESULT);
             case detail::State::ONLY_RESULT:
@@ -268,7 +270,7 @@ private:
                              currentThreadInExecutor())) {
             // execute inplace for better performance
             ContinuationReference guard(this);
-            _continuation(std::move(_try));
+            _continuation(std::move(_try_value));
         } else {
             ContinuationReference guard(this);
             ContinuationReference guardForException(this);
@@ -279,7 +281,7 @@ private:
                         [fsRef = std::move(guard)]() mutable {
                             auto ref = std::move(fsRef);
                             auto fs = ref.getFutureState();
-                            fs->_continuation(std::move(fs->_try));
+                            fs->_continuation(std::move(fs->_try_value));
                         });
                 } else {
                     ScheduleOptions opts;
@@ -290,7 +292,7 @@ private:
                         [fsRef = std::move(guard)]() mutable {
                             auto ref = std::move(fsRef);
                             auto fs = ref.getFutureState();
-                            fs->_continuation(std::move(fs->_try));
+                            fs->_continuation(std::move(fs->_try_value));
                         },
                         _context, opts);
                 }
@@ -300,7 +302,7 @@ private:
                 }
             } catch (std::exception& e) {
                 // reschedule failed, execute inplace
-                _continuation(std::move(_try));
+                _continuation(std::move(_try_value));
             }
         }
     }
@@ -320,7 +322,7 @@ private:
     std::atomic<detail::State> _state;
     std::atomic<uint8_t> _attached;
     std::atomic<uint8_t> _continuationRef;
-    Try<T> _try;
+    Try<T> _try_value;
     union {
         Continuation _continuation;
     };

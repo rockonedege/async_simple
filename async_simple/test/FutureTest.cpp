@@ -14,13 +14,15 @@
  * limitations under the License.
  */
 #include <exception>
-
-#include <async_simple/Future.h>
-#include <async_simple/executors/SimpleExecutor.h>
-#include <async_simple/test/unittest.h>
-#include <functional>
 #include <mutex>
+
 #include <vector>
+
+#include "async_simple/Collect.h"
+#include "async_simple/Future.h"
+#include "async_simple/Promise.h"
+#include "async_simple/executors/SimpleExecutor.h"
+#include "async_simple/test/unittest.h"
 
 using namespace std;
 using namespace async_simple::executors;
@@ -319,13 +321,13 @@ TEST_F(FutureTest, testWait) {
     // use doneCallback to know which step future finish.
     // use beginCallback to notify future start callback function.
     auto t = std::thread([&p, &beginCallback, &doneCallback]() {
-        usleep(100000);
+        std::this_thread::sleep_for(100000us);
         // sleep a little time and make sure the future callback do not start.
         EXPECT_EQ(0, doneCallback.load(std::memory_order_acquire));
         p.setValue(100);
         for (size_t i = 5;
              i > 0 && doneCallback.load(std::memory_order_acquire) != 1; i--) {
-            usleep(1000);
+            std::this_thread::sleep_for(1000us);
         }
         // the future callback has started but can not finish.
         EXPECT_EQ(1, doneCallback.load(std::memory_order_acquire));
@@ -333,7 +335,7 @@ TEST_F(FutureTest, testWait) {
         beginCallback.store(true, std::memory_order_release);
         for (size_t i = 500;
              i > 0 && doneCallback.load(std::memory_order_acquire) != 2; i--) {
-            usleep(10000);
+            std::this_thread::sleep_for(10000us);
         }
         // make sure future callback has finished
         EXPECT_EQ(2, doneCallback.load(std::memory_order_acquire));
@@ -357,13 +359,13 @@ TEST_F(FutureTest, testWaitCallback) {
                 auto f = p2.getFuture()
                              .via(&executor2)
                              .thenValue([x = std::move(res).value()](bool y) {
-                                 usleep(10000);
+                                 std::this_thread::sleep_for(10000us);
                                  return x;
                              });
                 return f;
             })
             .thenValue([](int x) {
-                usleep(20000);
+                std::this_thread::sleep_for(20000us);
                 return std::make_pair(x + 1, x);
             })
             .thenValue([&executor2](std::pair<int, int>&& res) {
@@ -372,7 +374,7 @@ TEST_F(FutureTest, testWaitCallback) {
                 Future<int> f = p3.getFuture()
                                     .via(&executor2)
                                     .thenValue([r = std::move(res)](bool y) {
-                                        usleep(30000);
+                                        std::this_thread::sleep_for(30000us);
                                         return r.first * r.second;
                                     });
                 p3.setValue(true);
@@ -416,6 +418,34 @@ TEST_F(FutureTest, testCollectAll) {
     EXPECT_TRUE(expected.empty());
 }
 
+TEST_F(FutureTest, testCollectAllVoid) {
+    SimpleExecutor executor(15);
+
+    size_t n = 10;
+    vector<Promise<void>> promise(n);
+    vector<Future<void>> futures;
+    for (size_t i = 0; i < n; ++i) {
+        futures.push_back(promise[i].getFuture().via(&executor));
+    }
+    vector<int> expected;
+    for (size_t i = 0; i < n; ++i) {
+        expected.push_back(i);
+    }
+    auto f = collectAll(futures.begin(), futures.end())
+                 .thenValue([&expected](vector<Try<void>>&& vec) {
+                     EXPECT_EQ(expected.size(), vec.size());
+                     expected.clear();
+                 });
+
+    for (size_t i = 0; i < n; ++i) {
+        promise[i].setValue();
+    }
+
+    f.wait();
+
+    EXPECT_TRUE(expected.empty());
+}
+
 TEST_F(FutureTest, testCollectReadyFutures) {
     SimpleExecutor executor(15);
 
@@ -429,7 +459,8 @@ TEST_F(FutureTest, testCollectReadyFutures) {
                  .thenValue([&executed, n](vector<Try<Dummy>>&& vec) {
                      EXPECT_EQ(n, vec.size());
                      for (size_t i = 0; i < vec.size(); ++i) {
-                         EXPECT_EQ(i, vec[i].value().value);
+                         EXPECT_EQ(
+                             i, static_cast<decltype(i)>(vec[i].value().value));
                      }
                      executed = true;
                  });
@@ -452,12 +483,13 @@ TEST_F(FutureTest, testPromiseBroken) {
     EXPECT_TRUE(r.hasError());
 }
 
+#ifndef USE_MODULES
 TEST_F(FutureTest, testViaAfterWait) {
     Promise<int> promise;
     auto future = promise.getFuture();
 
     auto t = std::thread([p = std::move(promise)]() mutable {
-        sleep(1);
+        std::this_thread::sleep_for(1s);
         p.setValue(100);
     });
 
@@ -466,12 +498,16 @@ TEST_F(FutureTest, testViaAfterWait) {
         [](int v) mutable { ASSERT_EQ(100, v); });
     t.join();
 }
+#endif
 
 TEST_F(FutureTest, testReadyFuture) {
     auto future = makeReadyFuture(3);
     future.wait();
     std::move(future).via(nullptr).thenValue(
         [](int v) mutable { ASSERT_EQ(3, v); });
+    auto future2 = makeReadyFuture();
+    EXPECT_TRUE(future2.hasResult());
+    EXPECT_TRUE(future2.valid());
 }
 
 TEST_F(FutureTest, testPromiseCopy) {
@@ -487,4 +523,61 @@ TEST_F(FutureTest, testPromiseCopy) {
     EXPECT_EQ(0, promise3.getFuture().value());
 }
 
+TEST_F(FutureTest, testVoidFuture) {
+    Promise<void> p;
+    auto f = p.getFuture();
+    int i = 0;
+    EXPECT_FALSE(f.hasResult());
+    f.setContinuation([&i](Try<void>) { EXPECT_EQ(i, 5); });
+    i = 5;
+    p.setValue();
+    EXPECT_TRUE(f.hasResult());
+
+    Promise<void> p2;
+    auto f2 = p2.getFuture()
+                  .thenTry([](Try<void>) {
+
+                  })
+                  .thenTry([](Try<void> t) { return t.value(); })
+                  .thenValue([]() { return 10; })
+                  .thenValue([](int i) { EXPECT_EQ(i, 10); });
+    p2.setValue();
+    f2.wait();
+
+    Promise<void> p3;
+    auto f3 = p3.getFuture();
+    ASSERT_THROW(f3.value(), std::logic_error);
+    auto f4 = std::move(f3)
+                  .thenTry([](Try<void> t) { return t.value(); })
+                  .thenTry([](Try<void> t) {
+                      try {
+                          t.value();
+                          return 0;
+                      } catch (...) {
+                          return 1;
+                      }
+                  });
+
+    try {
+        throw std::runtime_error("test exception");
+    } catch (...) {
+        p3.setException(std::current_exception());
+    }
+
+    f4.wait();
+    const Try<int>& t = f4.result();
+    EXPECT_TRUE(t.available());
+    EXPECT_FALSE(t.hasError());
+    EXPECT_EQ(1, std::move(f4).get());
+}
+
+TEST_F(FutureTest, testThen) {
+    Promise<int> p1;
+    auto f1 = p1.getFuture()
+                  .then([](int i) { return i * 2; })
+                  .then([](Try<int> t) { return t.value() * 2; })
+                  .then([](int i) { return i; });
+    p1.setValue(1);
+    EXPECT_EQ(f1.value(), 4);
+}
 }  // namespace async_simple
